@@ -1,0 +1,7 @@
+cellpose>=4.0
+numpy
+tifffile
+tqdm
+scikit-image
+scipy
+nd2reader

@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Large / generated pipeline I/O (keep locally)
+output/
+data/*.tif
+data/*.tiff
+
+# Regenerated refinement cache
+multiscale_cellpose/split_cell_refinement_cache/
