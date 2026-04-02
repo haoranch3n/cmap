@@ -12,3 +12,7 @@ data/*.tiff
 
 # Regenerated refinement cache
 multiscale_cellpose/split_cell_refinement_cache/
+
+# Local / editor
+.cursor/
+output (copy)/

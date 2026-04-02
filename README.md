@@ -1,5 +1,7 @@
 # DAPI 2D / 3D segmentation pipeline
 
+**Version:** 1.1
+
 Workflow: **preprocess volumetric DAPI → run Cellpose 2D per Z plane → (optional) stack and track in 3D.**
 
 This repo targets **DAPI-only** data. The older dual-channel (DAPI + cytoplasm) path, multiscale diameter merging, and mask postprocessing have been removed.

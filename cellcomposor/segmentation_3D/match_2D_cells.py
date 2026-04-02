@@ -2,6 +2,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from skimage.segmentation import find_boundaries
 from datetime import datetime
+from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
 """
@@ -110,54 +111,91 @@ def get_unmatched_list(matched_list, new_slice_cell_coords):
 	return unmatched_list, unmatched_list_index
 
 def matching_cells_2D(img, JI_thre):
-	#print(f"{datetime.now()} Starting matching_cells_2D with JI {JI_thre}...")
+	"""Match 2D cell labels across consecutive z-slices to build consistent 3D labels.
+
+	Uses a vectorised overlap-matrix approach with optimal (Hungarian) assignment.
+	"""
 	new_img = [img[0]]
-	#print(img.shape)
+	next_label = int(img[0].max()) + 1
+
 	for slice_num in tqdm(range(1, img.shape[0]), desc="Matching slices"):
-		#print("Matching", slice_num, 'th slice')
-		img_current_slice = new_img[slice_num-1].astype(int)
-		img_new_slice = img[slice_num].astype(int)
-		current_slice_cell_coords = get_indices_sparse(img_current_slice)[1:]
-		new_slice_cell_coords = get_indices_sparse(img_new_slice)[1:]
-		
-		current_slice_cell_coords = list(map(lambda x: np.array(x).T, current_slice_cell_coords))
-		new_slice_cell_coords = list(map(lambda x: np.array(x).T, new_slice_cell_coords))
-		
-		#print(f"{datetime.now()} After get_indices_sparse")
-		current_slice_cell_matched_list = []
-		new_slice_cell_matched_list = []
-		current_slice_cell_matched_index_list = []
-		new_slice_cell_matched_index_list = []
+		img_current = new_img[slice_num - 1]
+		img_new = img[slice_num]
 
-		for i in range(len(current_slice_cell_coords)):
-			if len(current_slice_cell_coords[i]) != 0:
-				new_slice_search_num = np.unique(list(map(lambda x: img_new_slice[tuple(x)], current_slice_cell_coords[i])))
-				best_JI = 0
-				current_slice_cell_best = []
-				for j in new_slice_search_num:
-					if j != 0:
-						if (j-1 not in new_slice_cell_matched_index_list) and (i not in current_slice_cell_matched_index_list):
-							current_slice_cell, new_slice_cell, JI = get_matched_cells(current_slice_cell_coords[i], new_slice_cell_coords[j-1])
-							if type(current_slice_cell) != bool:
-								if JI > best_JI and JI > JI_thre:
-									best_JI = JI
-									current_slice_cell_best = current_slice_cell
-									new_slice_cell_best = new_slice_cell
-									i_ind = i
-									j_ind = j-1
-				
-				if len(current_slice_cell_best) > 0:
-					current_slice_cell_matched_list.append(current_slice_cell_best)
-					new_slice_cell_matched_list.append(new_slice_cell_best)
-					current_slice_cell_matched_index_list.append(i_ind)
-					new_slice_cell_matched_index_list.append(j_ind)
+		cur_labels = np.unique(img_current)
+		cur_labels = cur_labels[cur_labels > 0]
+		new_labels = np.unique(img_new)
+		new_labels = new_labels[new_labels > 0]
 
-		#print(f"{datetime.now()} After i,j loop")
-		
-		new_slice_cell_unmatched_list, new_slice_cell_unmatched_index_list = get_unmatched_list(new_slice_cell_matched_index_list, new_slice_cell_coords)
-		new_slice_updated_mask = get_new_slice_mask(current_slice_cell_matched_index_list, new_slice_cell_matched_list, new_slice_cell_unmatched_list, len(np.unique(new_img[:slice_num])), img_current_slice.shape)
-		new_img.append(new_slice_updated_mask)
-		#print(f"{datetime.now()} After slice {slice_num}")
-	new_img = np.stack(new_img, axis=0)
-	#print(f"{datetime.now()} After matching")
-	return new_img
+		n_cur = len(cur_labels)
+		n_new = len(new_labels)
+
+		if n_new == 0:
+			new_img.append(np.zeros_like(img_new, dtype=np.int32))
+			continue
+
+		if n_cur == 0:
+			remap_lut = np.zeros(int(new_labels.max()) + 1, dtype=np.int32)
+			for lbl in new_labels:
+				remap_lut[int(lbl)] = next_label
+				next_label += 1
+			new_img.append(remap_lut[img_new])
+			continue
+
+		# -- vectorised overlap computation -----------------------------------
+		cur_flat = img_current.ravel().astype(np.intp)
+		new_flat = img_new.ravel().astype(np.intp)
+
+		size_cur_all = np.bincount(cur_flat)
+		size_new_all = np.bincount(new_flat)
+
+		max_cur_label = int(cur_labels.max())
+		max_new_label = int(new_labels.max())
+
+		cur_lut = np.full(max_cur_label + 1, -1, dtype=np.intp)
+		cur_lut[cur_labels] = np.arange(n_cur)
+		new_lut = np.full(max_new_label + 1, -1, dtype=np.intp)
+		new_lut[new_labels] = np.arange(n_new)
+
+		valid = (cur_flat > 0) & (new_flat > 0)
+		overlap_compact = np.zeros((n_cur, n_new), dtype=np.int64)
+		if valid.any():
+			cur_idx = cur_lut[cur_flat[valid]]
+			new_idx = new_lut[new_flat[valid]]
+			pair_idx = cur_idx * n_new + new_idx
+			overlap_flat = np.bincount(pair_idx, minlength=n_cur * n_new)
+			overlap_compact = overlap_flat.reshape(n_cur, n_new)
+
+		# -- Jaccard-index matrix (fully vectorised) --------------------------
+		size_cur_vec = size_cur_all[cur_labels]
+		size_new_vec = size_new_all[new_labels]
+		union_matrix = (size_cur_vec[:, None] + size_new_vec[None, :]
+		                - overlap_compact)
+		with np.errstate(divide='ignore', invalid='ignore'):
+			ji_matrix = np.where(union_matrix > 0,
+			                     overlap_compact / union_matrix, 0.0)
+
+		# -- optimal bipartite assignment (Hungarian) -------------------------
+		cost = 1.0 - ji_matrix
+		row_ind, col_ind = linear_sum_assignment(cost)
+
+		label_map = {}
+		matched_new = set()
+		for r, c in zip(row_ind, col_ind):
+			if ji_matrix[r, c] > JI_thre:
+				label_map[int(new_labels[c])] = int(cur_labels[r])
+				matched_new.add(int(new_labels[c]))
+
+		# -- remap via LUT ----------------------------------------------------
+		remap_lut = np.zeros(max_new_label + 1, dtype=np.int32)
+		for new_lbl, cur_lbl in label_map.items():
+			remap_lut[new_lbl] = cur_lbl
+		for lbl in new_labels:
+			lbl_int = int(lbl)
+			if lbl_int not in matched_new:
+				remap_lut[lbl_int] = next_label
+				next_label += 1
+
+		new_img.append(remap_lut[img_new])
+
+	return np.stack(new_img, axis=0)

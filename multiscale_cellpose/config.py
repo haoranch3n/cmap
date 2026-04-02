@@ -2,8 +2,6 @@
 import sys
 from pathlib import Path
 
-import numpy as np
-
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -15,8 +13,7 @@ from pipeline_config import (  # noqa: E402
     TIF_PLANES_DIR,
     SEGMENTATION_2D_DIR,
     CELLPOSE_PRETRAINED_MODEL,
+    AREA_THRESHOLD,
 )
 
-# Kept for optional scripts that still expect BASE_DIR-style names
 BASE_DIR = OUTPUT_DIR
-AREA_THRESHOLD = np.pi * 20**2
