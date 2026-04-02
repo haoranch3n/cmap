@@ -1,6 +1,6 @@
 # DAPI 2D / 3D segmentation pipeline
 
-**Version:** 1.1
+**Version:** 1.2
 
 Workflow: **preprocess volumetric DAPI → run Cellpose 2D per Z plane → (optional) stack and track in 3D.**
 

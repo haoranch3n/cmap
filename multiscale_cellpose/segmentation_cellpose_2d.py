@@ -32,6 +32,7 @@ from pipeline_config import (  # noqa: E402
     CELLPOSE_PRETRAINED_MODEL,
     SEGMENTATION_2D_DIAMETERS_DIR,
     SEGMENTATION_2D_DIR,
+    SPLIT_COVERAGE_THRESHOLD,
     TIF_PLANES_DIR,
 )
 
@@ -237,7 +238,8 @@ def split_merged_cells(filtered_mask, all_masks_sorted, threshold=0.8):
 
 
 def final_cleanup(mask, area_threshold, connectivity=1):
-    """Relabel sequentially, keep only single-component cells >= *area_threshold*."""
+    """Relabel sequentially, keep the largest connected component of each cell
+    and discard cells smaller than *area_threshold*."""
     mask, _, _ = relabel_sequential(mask.astype(np.int32))
     new_mask = np.zeros_like(mask, dtype=np.int32)
     new_id = 1
@@ -249,8 +251,13 @@ def final_cleanup(mask, area_threshold, connectivity=1):
         labeled_local, n_components = label(
             region, connectivity=connectivity, return_num=True
         )
+        if n_components > 1:
+            sizes = np.bincount(labeled_local.ravel())[1:]
+            largest_cc = int(np.argmax(sizes)) + 1
+            region = labeled_local == largest_cc
+
         area = int(region.sum())
-        if n_components == 1 and area >= area_threshold:
+        if area >= area_threshold:
             view = new_mask[minr:maxr, minc:maxc]
             view[region] = new_id
             new_id += 1
@@ -293,7 +300,6 @@ def merge_diameter_masks(dapi_path, diameters, tif_planes_root, diameters_root):
         combined = np.where(updated > 0, updated, combined).astype(np.int32)
 
     combined = filter_small_objects(combined, AREA_THRESHOLD)
-    combined = split_merged_cells(combined, masks, threshold=0.8)
     combined = final_cleanup(combined, AREA_THRESHOLD)
 
     return combined

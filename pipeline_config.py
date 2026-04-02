@@ -20,9 +20,10 @@ CELLPOSE_CELLPROB_THRESHOLD = 0.0
 
 # -- Multiscale merge / filter -----------------------------------------------
 AREA_THRESHOLD = int(np.pi * 20 ** 2)
+SPLIT_COVERAGE_THRESHOLD = 0.9        # cumulative overlap to trigger cell splitting
 
 # -- 3D matching --------------------------------------------------------------
-JI_THRESHOLD = 0.3
+JI_THRESHOLD = 0.2
 
 # -- 3D post-processing -------------------------------------------------------
 MIN_CELL_VOLUME_3D = 100              # voxels

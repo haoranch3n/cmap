@@ -9,6 +9,7 @@ import tqdm
 from multiprocessing import Pool
 from skimage.io import imread
 from skimage.measure import regionprops, label as sklabel
+from skimage.segmentation import find_boundaries
 from tifffile import imwrite
 
 from segmentation_3D.match_2D_cells import matching_cells_2D
@@ -40,18 +41,24 @@ def filter_single_slice_cells(seg_3D):
 
 
 def make_color_mask(seg_3D):
-    """Assign each cell in seg_3D a random color from tab20 colormap."""
+    """RGB preview: random tab20 colors per label, black boundaries between cells."""
     labels = np.unique(seg_3D)
     labels = labels[labels != 0]
+    if labels.size == 0:
+        return np.zeros(seg_3D.shape + (3,), dtype=np.uint8)
 
     cmap = plt.get_cmap("tab20")
     rng = np.random.default_rng()
     colors = (np.array([cmap(rng.integers(0, 20))[:3] for _ in labels]) * 255).astype(np.uint8)
 
-    lut = np.zeros((seg_3D.max() + 1, 3), dtype=np.uint8)
+    max_lbl = int(seg_3D.max())
+    lut = np.zeros((max_lbl + 1, 3), dtype=np.uint8)
     lut[labels] = colors
 
-    return lut[seg_3D]
+    color_mask = lut[seg_3D].copy()
+    boundaries = find_boundaries(seg_3D, mode="thick", connectivity=1)
+    color_mask[boundaries] = (0, 0, 0)
+    return color_mask
 
 
 def stacked_volume_stem(stack_path: str) -> str:
@@ -217,6 +224,108 @@ def filter_small_volumes(seg_3D, min_volume):
     return seg_3D
 
 
+def absorb_short_fragments(seg_3D, max_short_span=15, ji_thre=0.3,
+                           max_iterations=5):
+    """Iteratively merge short cell fragments into longer overlapping cells.
+
+    For each cell spanning <= *max_short_span* slices, compare its XY footprint
+    with cells present on the slices just before / after it.  If a longer cell
+    has IoU > *ji_thre*, relabel the short cell to match the longer one.
+    Repeats up to *max_iterations* times because merging can extend z-spans and
+    create new merge opportunities.
+    """
+    total_merged = 0
+
+    for iteration in range(max_iterations):
+        props = regionprops(seg_3D)
+        if not props:
+            break
+
+        cell_spans = {}
+        for p in props:
+            zmin, _, _, zmax, _, _ = p.bbox
+            cell_spans[p.label] = (int(zmin), int(zmax))
+
+        merge_map = {}
+
+        short_cells = sorted(
+            [p for p in props
+             if cell_spans[p.label][1] - cell_spans[p.label][0] <= max_short_span],
+            key=lambda p: cell_spans[p.label][1] - cell_spans[p.label][0],
+        )
+
+        for p in short_cells:
+            lbl = p.label
+            if lbl in merge_map:
+                continue
+            zmin, zmax = cell_spans[lbl]
+
+            first_mask = seg_3D[zmin] == lbl
+            last_mask = seg_3D[zmax - 1] == lbl
+
+            best_target, best_ji = None, 0.0
+
+            check_before = range(max(0, zmin - 3), zmin)
+            check_after = range(zmax, min(seg_3D.shape[0], zmax + 3))
+
+            for z in check_before:
+                ref = first_mask
+                others = np.unique(seg_3D[z][ref])
+                for o in others:
+                    o = int(o)
+                    if o == 0 or o == lbl or o in merge_map:
+                        continue
+                    o_span = cell_spans.get(o)
+                    if o_span is None:
+                        continue
+                    if o_span[1] - o_span[0] <= zmax - zmin:
+                        continue
+                    o_mask = seg_3D[z] == o
+                    inter = int(np.sum(ref & o_mask))
+                    union = int(np.sum(ref | o_mask))
+                    if union > 0:
+                        ji = inter / union
+                        if ji > best_ji and ji > ji_thre:
+                            best_ji, best_target = ji, o
+
+            for z in check_after:
+                ref = last_mask
+                others = np.unique(seg_3D[z][ref])
+                for o in others:
+                    o = int(o)
+                    if o == 0 or o == lbl or o in merge_map:
+                        continue
+                    o_span = cell_spans.get(o)
+                    if o_span is None:
+                        continue
+                    if o_span[1] - o_span[0] <= zmax - zmin:
+                        continue
+                    o_mask = seg_3D[z] == o
+                    inter = int(np.sum(ref & o_mask))
+                    union = int(np.sum(ref | o_mask))
+                    if union > 0:
+                        ji = inter / union
+                        if ji > best_ji and ji > ji_thre:
+                            best_ji, best_target = ji, o
+
+            if best_target is not None:
+                merge_map[lbl] = best_target
+
+        if not merge_map:
+            break
+
+        max_label = int(seg_3D.max())
+        lut = np.arange(max_label + 1, dtype=np.int32)
+        for short_lbl, long_lbl in merge_map.items():
+            lut[short_lbl] = long_lbl
+        seg_3D = lut[seg_3D.astype(np.int32)]
+        total_merged += len(merge_map)
+
+    if total_merged:
+        print(f"  Fragment absorption: merged {total_merged} short fragment(s)")
+    return seg_3D
+
+
 def relabel_contiguous(seg_3D):
     """Relabel cells to contiguous integers 1..N."""
     labels = np.unique(seg_3D)
@@ -239,8 +348,17 @@ def process_stacked_2D_segmentation(seg_2D_stack_path, JI_thre=JI_THRESHOLD):
     rel = os.path.relpath(seg_2D_stack_path, base_dir)
     output_folder = os.path.join(os.fspath(SEGMENTATION_3D_DIR), os.path.dirname(rel))
     index_mask_path = os.path.join(output_folder, f"{img_name}_indexed.tif")
+    color_mask_path = os.path.join(output_folder, f"{img_name}_color.tif")
     if os.path.exists(index_mask_path):
-        print(f"Indexed mask already exists for {seg_2D_stack_path}, skipping...")
+        if os.path.exists(color_mask_path):
+            print(f"Indexed + color already exist for {seg_2D_stack_path}, skipping...")
+            return
+        print(f"Indexed mask exists but color missing; writing RGB preview from {index_mask_path}")
+        os.makedirs(output_folder, exist_ok=True)
+        seg_3D = imread(index_mask_path)
+        color_mask = make_color_mask(seg_3D)
+        imwrite(color_mask_path, color_mask, photometric="rgb")
+        print(f"  Saved {color_mask_path}")
         return
     print("Processing stacked 2D segmentation")
     print(f"  Input:  {seg_2D_stack_path}")
@@ -256,6 +374,9 @@ def process_stacked_2D_segmentation(seg_2D_stack_path, JI_thre=JI_THRESHOLD):
 
     print("  Bridging gaps across missing slices...")
     seg_3D = bridge_gaps(seg_3D, ji_thre=JI_thre)
+
+    print("  Absorbing short fragments into longer cells...")
+    seg_3D = absorb_short_fragments(seg_3D, max_short_span=15, ji_thre=JI_thre)
 
     print("  Filtering single-slice cells...")
     seg_3D = filter_single_slice_cells(seg_3D)
@@ -277,9 +398,9 @@ def process_stacked_2D_segmentation(seg_2D_stack_path, JI_thre=JI_THRESHOLD):
     print("  Saving indexed mask...")
     imwrite(os.path.join(output_folder, f"{img_name}_indexed.tif"), seg_3D.astype(np.uint16))
 
+    print("  Saving RGB color preview...")
     color_mask = make_color_mask(seg_3D)
-    output_color = os.path.join(output_folder, f"{img_name}_color.tif")
-    imwrite(output_color, color_mask, photometric="rgb")
+    imwrite(color_mask_path, color_mask, photometric="rgb")
 
 
 def main():
