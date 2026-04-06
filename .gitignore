@@ -7,8 +7,7 @@ __pycache__/
 
 # Large / generated pipeline I/O (keep locally)
 output/
-data/*.tif
-data/*.tiff
+data/
 
 # Regenerated refinement cache
 multiscale_cellpose/split_cell_refinement_cache/

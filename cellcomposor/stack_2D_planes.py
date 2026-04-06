@@ -51,6 +51,33 @@ def discover_flat_volumes(base_folder):
     return volumes
 
 
+def discover_deep_flat_volumes(base_folder):
+    """
+    Like discover_flat_volumes, but allows an arbitrary-depth volume path under
+    base_folder: .../<volume_rel>/<zfolder>/<zfolder>_final_mask.tif
+
+    When z-folders sit directly under *base_folder* (no intermediate volume
+    directory), the volume key is ``""`` so callers can handle this root-level
+    case separately.
+    """
+    base_folder = os.path.abspath(base_folder)
+    groups = defaultdict(list)
+    if not os.path.isdir(base_folder):
+        return {}
+    for r, _dirs, files in os.walk(base_folder):
+        for fn in files:
+            if not fn.endswith("_final_mask.tif"):
+                continue
+            stem = fn[: -len("_final_mask.tif")]
+            if os.path.basename(r) != stem:
+                continue
+            vol_rel = os.path.relpath(os.path.dirname(r), base_folder)
+            if vol_rel == ".":
+                vol_rel = ""
+            groups[vol_rel].append(stem)
+    return {k: sorted(v, key=tz_sort_key) for k, v in groups.items() if v}
+
+
 def build_nested_structure(paths, base_folder):
     """
     Returns a dict keyed by the relative animal folder, which includes the middle dirs.
@@ -131,10 +158,23 @@ def stack_one_section(base_folder, out_base, animal_rel, section, zfolders, out_
 
 
 def stack_one_flat_volume(base_folder, out_base, volume_name, zfolders, out_dtype=np.uint16):
-    """Stack z-slices for layout base_folder/<volume_name>/<zfolder>/mask.tif."""
-    out_folder = os.path.join(out_base, volume_name)
+    """Stack z-slices for layout base_folder/<volume_name>/<zfolder>/mask.tif.
+
+    When *volume_name* is ``""`` the z-folders sit directly under *base_folder*
+    (per-image output mode).  The output stem is derived from ``OUTPUT_DIR``.
+    """
+    if volume_name:
+        mask_root = os.path.join(base_folder, volume_name)
+        out_folder = os.path.join(out_base, volume_name)
+        stem = os.path.basename(volume_name)
+    else:
+        mask_root = base_folder
+        out_folder = out_base
+        from pipeline_config import OUTPUT_DIR
+        stem = OUTPUT_DIR.name
+
     ensure_dir(out_folder)
-    out_path = os.path.join(out_folder, f"{volume_name}_2D_stacked.tif")
+    out_path = os.path.join(out_folder, f"{stem}_2D_stacked.tif")
 
     if should_skip(out_path):
         return f"Skip existing: {out_path}"
@@ -142,7 +182,7 @@ def stack_one_flat_volume(base_folder, out_base, volume_name, zfolders, out_dtyp
     volume = []
     missing = 0
     for zf in zfolders:
-        abs_folder = os.path.join(base_folder, volume_name, zf)
+        abs_folder = os.path.join(mask_root, zf)
         tif_path = os.path.join(abs_folder, f"{zf}_final_mask.tif")
         if os.path.exists(tif_path):
             img = tifffile.imread(tif_path)
@@ -151,7 +191,7 @@ def stack_one_flat_volume(base_folder, out_base, volume_name, zfolders, out_dtyp
             missing += 1
 
     if not volume:
-        return f"No slices found for flat volume {volume_name}  missing {missing}"
+        return f"No slices found for flat volume {stem}  missing {missing}"
 
     vol = np.stack(volume, axis=0)
     tifffile.imwrite(out_path, vol.astype(out_dtype))
@@ -205,6 +245,8 @@ if __name__ == "__main__":
         stack_and_save_multiproc(nested, input_base, output_base, out_dtype=np.uint16, max_workers=16)
     else:
         flat = discover_flat_volumes(input_base)
+        if not flat:
+            flat = discover_deep_flat_volumes(input_base)
         if flat:
             print(f"Flat volume layout: {len(flat)} volume(s)")
             for vol_name, zfolders in flat.items():

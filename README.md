@@ -1,6 +1,6 @@
 # DAPI 2D / 3D segmentation pipeline
 
-**Version:** 1.2
+**Version:** 1.2.1
 
 Workflow: **preprocess volumetric DAPI → run Cellpose 2D per Z plane → (optional) stack and track in 3D.**
 
@@ -19,7 +19,7 @@ This repo targets **DAPI-only** data. The older dual-channel (DAPI + cytoplasm) 
 | `DATA_DIR` | Input volumes (e.g. `data/`) |
 | `TIF_PLANES_DIR` | Per-slice `*_DAPI.tif` (`output/tif_planes/`) |
 | `SEGMENTATION_2D_DIR` | One `*_final_mask.tif` per slice (`output/segmentation_2D_planes/`) |
-| `SEGMENTATION_2D_STACKED_DIR` | Z-stacks of 2D masks (`output/segmentation_2D_stacked/`) |
+| `SEGMENTATION_2D_STACKED_DIR` | Z-stacks of 2D masks (`output/segmentation_2D_stack/`) |
 | `SEGMENTATION_3D_DIR` | 3D label volumes (`output/segmentation_3D_masks/`) |
 
 ## Execution order

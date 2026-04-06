@@ -21,6 +21,7 @@ from pipeline_config import (
     SEGMENTATION_2D_STACKED_DIR,
     SEGMENTATION_3D_DIR,
     JI_THRESHOLD,
+    MIN_CELL_Z_SPAN,
     MIN_CELL_VOLUME_3D,
     MAX_AREA_CHANGE_RATIO,
 )
@@ -28,15 +29,19 @@ from pipeline_config import (
 base_dir = os.fspath(SEGMENTATION_2D_STACKED_DIR)
 
 
-def filter_single_slice_cells(seg_3D):
-    """Remove cells that only appear in a single z-slice using regionprops."""
+def filter_short_z_cells(seg_3D, min_z_span=MIN_CELL_Z_SPAN):
+    """Remove cells that span fewer than *min_z_span* z-slices."""
     seg_3D_filtered = seg_3D.copy()
     props = regionprops(seg_3D)
+    n_removed = 0
 
-    for p in tqdm.tqdm(props, desc="Filtering single-slice cells using regionprops"):
+    for p in tqdm.tqdm(props, desc=f"Filtering cells with z-span < {min_z_span}"):
         zmin, ymin, xmin, zmax, ymax, xmax = p.bbox
-        if zmax - zmin == 1:
+        if zmax - zmin < min_z_span:
             seg_3D_filtered[seg_3D == p.label] = 0
+            n_removed += 1
+
+    print(f"  Z-span filter: removed {n_removed} cell(s) spanning < {min_z_span} slices")
     return seg_3D_filtered
 
 
@@ -181,31 +186,60 @@ def split_disconnected_3d(seg_3D):
 
 
 def filter_size_inconsistent(seg_3D, max_ratio=3.0):
-    """Remove cells whose 2D cross-section area jumps by more than *max_ratio*
-    between consecutive occupied z-slices."""
+    """Trim slices where a cell's cross-section area jumps by more than
+    *max_ratio* relative to its neighbour.  Trimming works inward from both
+    ends of the cell's z-range: any leading or trailing slices that violate
+    the ratio are removed.  If after trimming fewer than 2 slices remain the
+    cell is deleted entirely."""
     props = regionprops(seg_3D)
-    bad_labels = set()
+    n_trimmed = 0
+    n_removed = 0
 
     for p in props:
         zmin, _, _, zmax, _, _ = p.bbox
         if zmax - zmin <= 1:
             continue
-        areas = []
+
+        z_areas = []
         for z in range(zmin, zmax):
             a = int(np.sum(seg_3D[z] == p.label))
             if a > 0:
-                areas.append(a)
-        if len(areas) < 2:
+                z_areas.append((z, a))
+        if len(z_areas) < 2:
             continue
-        for k in range(1, len(areas)):
-            lo, hi = sorted((areas[k - 1], areas[k]))
+
+        # Trim from the end (bottom)
+        while len(z_areas) >= 2:
+            lo, hi = sorted((z_areas[-1][1], z_areas[-2][1]))
             if lo > 0 and hi / lo > max_ratio:
-                bad_labels.add(p.label)
+                bad_z = z_areas.pop()[0]
+                seg_3D[bad_z][seg_3D[bad_z] == p.label] = 0
+                n_trimmed += 1
+            else:
                 break
 
-    if bad_labels:
-        seg_3D[np.isin(seg_3D, list(bad_labels))] = 0
-        print(f"  Size-consistency: removed {len(bad_labels)} cell(s)")
+        # Trim from the start (top)
+        while len(z_areas) >= 2:
+            lo, hi = sorted((z_areas[0][1], z_areas[1][1]))
+            if lo > 0 and hi / lo > max_ratio:
+                bad_z = z_areas.pop(0)[0]
+                seg_3D[bad_z][seg_3D[bad_z] == p.label] = 0
+                n_trimmed += 1
+            else:
+                break
+
+        if len(z_areas) < 2:
+            for z, _ in z_areas:
+                seg_3D[z][seg_3D[z] == p.label] = 0
+            n_removed += 1
+
+    parts = []
+    if n_trimmed:
+        parts.append(f"trimmed {n_trimmed} slice(s)")
+    if n_removed:
+        parts.append(f"removed {n_removed} cell(s) entirely")
+    if parts:
+        print(f"  Size-consistency: {', '.join(parts)}")
     return seg_3D
 
 
@@ -343,13 +377,15 @@ def relabel_contiguous(seg_3D):
 # Main processing entry point
 # ---------------------------------------------------------------------------
 
-def process_stacked_2D_segmentation(seg_2D_stack_path, JI_thre=JI_THRESHOLD):
+def process_stacked_2D_segmentation(seg_2D_stack_path, JI_thre=JI_THRESHOLD,
+                                    force=False):
     img_name = f"{stacked_volume_stem(seg_2D_stack_path)}_3D"
     rel = os.path.relpath(seg_2D_stack_path, base_dir)
     output_folder = os.path.join(os.fspath(SEGMENTATION_3D_DIR), os.path.dirname(rel))
     index_mask_path = os.path.join(output_folder, f"{img_name}_indexed.tif")
     color_mask_path = os.path.join(output_folder, f"{img_name}_color.tif")
-    if os.path.exists(index_mask_path):
+
+    if not force and os.path.exists(index_mask_path):
         if os.path.exists(color_mask_path):
             print(f"Indexed + color already exist for {seg_2D_stack_path}, skipping...")
             return
@@ -360,6 +396,7 @@ def process_stacked_2D_segmentation(seg_2D_stack_path, JI_thre=JI_THRESHOLD):
         imwrite(color_mask_path, color_mask, photometric="rgb")
         print(f"  Saved {color_mask_path}")
         return
+
     print("Processing stacked 2D segmentation")
     print(f"  Input:  {seg_2D_stack_path}")
 
@@ -378,8 +415,8 @@ def process_stacked_2D_segmentation(seg_2D_stack_path, JI_thre=JI_THRESHOLD):
     print("  Absorbing short fragments into longer cells...")
     seg_3D = absorb_short_fragments(seg_3D, max_short_span=15, ji_thre=JI_thre)
 
-    print("  Filtering single-slice cells...")
-    seg_3D = filter_single_slice_cells(seg_3D)
+    print(f"  Filtering cells with z-span < {MIN_CELL_Z_SPAN}...")
+    seg_3D = filter_short_z_cells(seg_3D, min_z_span=MIN_CELL_Z_SPAN)
 
     print("  Splitting disconnected 3D components...")
     seg_3D = split_disconnected_3d(seg_3D)
@@ -390,20 +427,39 @@ def process_stacked_2D_segmentation(seg_2D_stack_path, JI_thre=JI_THRESHOLD):
     print("  Filtering small-volume cells...")
     seg_3D = filter_small_volumes(seg_3D, min_volume=MIN_CELL_VOLUME_3D)
 
+    print(f"  Final z-span filter (z < {MIN_CELL_Z_SPAN})...")
+    seg_3D = filter_short_z_cells(seg_3D, min_z_span=MIN_CELL_Z_SPAN)
+
     print("  Relabeling to contiguous IDs...")
     seg_3D = relabel_contiguous(seg_3D)
 
     print(f"  Final: {len(np.unique(seg_3D))} unique labels")
 
+    # Write to temp files first, then atomically replace old outputs
+    tmp_index = index_mask_path + ".tmp"
+    tmp_color = color_mask_path + ".tmp"
+
     print("  Saving indexed mask...")
-    imwrite(os.path.join(output_folder, f"{img_name}_indexed.tif"), seg_3D.astype(np.uint16))
+    imwrite(tmp_index, seg_3D.astype(np.uint16))
+    os.replace(tmp_index, index_mask_path)
 
     print("  Saving RGB color preview...")
     color_mask = make_color_mask(seg_3D)
-    imwrite(color_mask_path, color_mask, photometric="rgb")
+    imwrite(tmp_color, color_mask, photometric="rgb")
+    os.replace(tmp_color, color_mask_path)
+
+
+def _process_force(path):
+    return process_stacked_2D_segmentation(path, force=True)
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--force", action="store_true",
+                    help="Re-generate even if outputs already exist")
+    args = ap.parse_args()
+
     stacked_list = glob.glob(os.path.join(base_dir, "**", "*_2D_stacked.tif"), recursive=True)
     if not stacked_list:
         print(f"No *_2D_stacked.tif under {base_dir}")
@@ -411,9 +467,10 @@ def main():
     np.random.shuffle(stacked_list)
     print(f"Found {len(stacked_list)} stack(s), e.g. {stacked_list[:3]}")
 
+    target = _process_force if args.force else process_stacked_2D_segmentation
     n_workers = min(32, len(stacked_list), (os.cpu_count() or 8))
     with Pool(processes=max(1, n_workers)) as pool:
-        pool.map(process_stacked_2D_segmentation, stacked_list)
+        pool.map(target, stacked_list)
 
     print("Processing completed.")
 

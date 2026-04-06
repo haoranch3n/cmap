@@ -34,6 +34,7 @@ from pipeline_config import (  # noqa: E402
     SEGMENTATION_2D_DIR,
     SPLIT_COVERAGE_THRESHOLD,
     TIF_PLANES_DIR,
+    strip_path_shared_with_output_mirror,
 )
 
 try:
@@ -65,17 +66,29 @@ def plane_stem_from_dapi_path(dapi_path: str) -> str:
 
 
 def diameter_mask_dir(dapi_path, tif_planes_root, diameters_root):
-    rel_parent = os.path.relpath(os.path.dirname(dapi_path), tif_planes_root)
+    rel_parent = strip_path_shared_with_output_mirror(
+        os.path.relpath(os.path.dirname(dapi_path), tif_planes_root)
+    )
     stem = plane_stem_from_dapi_path(dapi_path)
-    out_dir = os.path.join(diameters_root, rel_parent, stem)
+    out_dir = (
+        os.path.join(diameters_root, rel_parent, stem)
+        if rel_parent
+        else os.path.join(diameters_root, stem)
+    )
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
 
 def output_final_mask_path(dapi_path, tif_planes_root, seg_root):
-    rel_parent = os.path.relpath(os.path.dirname(dapi_path), tif_planes_root)
+    rel_parent = strip_path_shared_with_output_mirror(
+        os.path.relpath(os.path.dirname(dapi_path), tif_planes_root)
+    )
     stem = plane_stem_from_dapi_path(dapi_path)
-    out_dir = os.path.join(seg_root, rel_parent, stem)
+    out_dir = (
+        os.path.join(seg_root, rel_parent, stem)
+        if rel_parent
+        else os.path.join(seg_root, stem)
+    )
     os.makedirs(out_dir, exist_ok=True)
     return os.path.join(out_dir, f"{stem}_final_mask.tif")
 

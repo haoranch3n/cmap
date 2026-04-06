@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from pipeline_config import SEGMENTATION_3D_DIR
+
 ROOT = Path(__file__).resolve().parent
 
 STEPS = [
@@ -26,7 +28,7 @@ def main() -> int:
         if r.returncode != 0:
             print(f"Step failed: {cmd}", file=sys.stderr)
             return r.returncode
-    print("\nPipeline finished. 3D masks: output/segmentation_3D_masks/", flush=True)
+    print(f"\nPipeline finished. 3D masks: {SEGMENTATION_3D_DIR}/", flush=True)
     return 0
 
 

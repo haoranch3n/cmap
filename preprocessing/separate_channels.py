@@ -23,7 +23,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from pipeline_config import DATA_DIR, TIF_PLANES_DIR
+from pipeline_config import DATA_DIR, OUTPUT_DIR, TIF_PLANES_DIR
 
 try:
     from nd2reader import ND2Reader
@@ -56,7 +56,10 @@ def compute_out_dir(path: str, image_dir: str, out_root: str) -> Path:
         rel_parent = p.parent.relative_to(image_dir_p)
     except Exception:
         rel_parent = Path()
-    out_dir = Path(out_root) / rel_parent / p.stem
+    out_dir = Path(out_root) / rel_parent
+    # Avoid .../488nm_crop/488nm_crop/ when OUTPUT_DIR already ends with the volume stem.
+    if p.stem != OUTPUT_DIR.name:
+        out_dir = out_dir / p.stem
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
