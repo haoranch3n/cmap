@@ -1,0 +1,86 @@
+# iGluSnFR Analysis Toolbox v3 — Agent Context
+
+## Project Overview
+
+This is a napari-based toolbox for processing, visualizing, and analyzing
+iGluSnFR glutamate calcium imaging data. It runs on Linux with NVIDIA GPUs.
+
+## Architecture
+
+Two conda environments:
+- **iglusnfr_viewer** (Python 3.10): napari GUI, plotting, analysis
+- **iglusnfr_processing** (Python 3.9): ilastik, CuPy, GPU processing
+
+The viewer launches processing as a **subprocess** in the processing env.
+
+## Key Files
+
+| File | Lines | Role |
+|------|-------|------|
+| `viewer.py` | ~2977 | Main napari app. 3 tabs: Processing, View Results, Analyze Results. Qt widgets. |
+| `processing_utils.py` | ~897 | GPU pipeline: background subtraction (CuPy), ilastik classification, clustering, SNR filtering, morphology extraction. |
+| `trace_analysis.py` | ~1670 | Firing detection (rolling mean + SD threshold), evoked/PPR quantification, outlier scoring (per-metric z-scores), summary CSVs, matplotlib plots. |
+| `analyze_results.py` | ~401 | CSV discovery, filename metadata extraction (regex), Polars/Pandas combination. |
+| `outlier_explorer.py` | ~293 | QDialog with matplotlib histograms + RangeSliders for interactive outlier flagging. |
+| `config_manager.py` | ~397 | Hierarchical JSON config: DEFAULT_CONFIG, resolve per-subfolder, GUI overrides, template generation. |
+| `config.py` | ~91 | Re-exports from config_manager + env name helpers. |
+
+## UI Structure (viewer.py)
+
+### Processing Tab (ProcessingWidget)
+Order: Input Data → Config File → Output Dir → ilastik Model → Parameters → Run Controls → Log → View Results button
+
+### View Results Tab
+- `DatasetLoaderWidget`: folder browser, dataset dropdown, load button
+- `ROIPlotterWidget`: Plotly trace viewer, firing detection params, "Open Outlier Explorer" button
+- `NapariViewer`: manages layers (image, labels, ROI text, outlier points, shapes)
+
+### Analyze Results Tab (AnalyzeResultsWidget)
+Order: Output Folder → Config File → Detected Metadata → Groups → Acquisition & Baseline → Firing Detection → Evoked → PPR → Outlier Detection → Run → Log
+
+## Config System
+
+`iglusnfr_config.json` files can be placed at any level in the input folder hierarchy. Resolution: defaults → root config → subfolder config → GUI overrides.
+
+Sections: `processing`, `viewing`, `analysis`, `ui`
+
+## Critical Implementation Details
+
+- **Outlier layer**: Updated IN-PLACE (`layer.data = ...`, `layer.face_color = ...`) to avoid segfaults from remove+add during napari render cycles
+- **Processing subprocess**: Uses `repr()` (not `json.dumps()`) for embedding dicts in generated f-string scripts to avoid brace conflicts
+- **Polars CSV I/O**: Reads all columns as String first (`infer_schema_length=0`), then casts numeric columns explicitly to avoid type conflicts during concat
+- **Filename metadata regex**: Uses `(?<![A-Z])` negative lookbehind to prevent "14APOE" matching as AP=14
+- **Napari compatibility**: Uses `border_color` (not `edge_color`) for points layers (napari 0.6.x)
+- **Qt timers**: `QTimer.singleShot` used to defer layer operations after render cycles
+
+## Morphology Metrics
+
+Extracted per ROI via `skimage.regionprops_table`: `eccentricity`, `solidity`, `perimeter`, plus derived `circularity = 4*pi*area / perimeter^2`.
+
+## Outlier Detection
+
+Two modes:
+1. **Batch** (Analyze Results): Per-metric MAD-based z-scores with configurable thresholds. 7 metrics.
+2. **Interactive** (View Results → Outlier Explorer): Histogram range sliders, no z-scores.
+
+## Testing
+
+```bash
+# Syntax check all Python files
+for f in *.py; do python -m py_compile "$f"; done
+
+# Launch viewer
+./run_viewer.sh
+
+# Run pipeline test (update paths in test_pipeline.py first)
+~/.conda/envs/iglusnfr_processing/bin/python test_pipeline.py
+```
+
+## Coding Conventions
+
+- All parameters should be in `config_manager.DEFAULT_CONFIG` (single source of truth)
+- No hardcoded paths — use `os.path`, `Config.TOOLBOX_DIR`, env discovery
+- GPU code in processing_utils only (never import cupy in viewer)
+- Use `QTimer.singleShot` when touching napari layers from callbacks
+- Box plots / group stats use per-image means as data points (not individual ROIs)
+- Settings persist to `~/.iglusnfr_settings.json`

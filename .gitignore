@@ -1,0 +1,15 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+
+# Local pipeline outputs (regenerate)
+output/
+
+# Standalone project with its own git history (track separately or submodule)
+napari-plugin/
+
+# Archived legacy trees are kept on disk for reference but are too large
+# for normal git history; see archive/README.md
+archive/legacy_modules/
