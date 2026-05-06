@@ -1,0 +1,12 @@
+---
+description: Run heavy work via LSF on compute nodes, not on the login node.
+alwaysApply: true
+---
+
+# HPC execution (CMAP)
+
+- **Do not** on the **login node**: Cellpose / GPU inference, full-volume TIFF I/O, full pipeline runs, long Python loops over large arrays, training, or multi-minute CPU jobs.
+- **Do** submit work with **`bsub`** to an appropriate queue (e.g. **`standard`** for CPU-only checks, **`rhel88_gpu`** for GPU / Cellpose). One-slice Cellpose debug: `segmentation_multiscale_cellpose_3D/scripts/bsub_debug_cellpose_one_slice.sh` (CPU) or `bsub_debug_cellpose_one_slice_gpu.sh` (GPU). Prefer **no email** flags unless the user asks (`#BSUB -B` / `#BSUB -N` omitted).
+- **OK on login**: `bsub`, `bjobs`, `bpeek`, `tail`/`head`/`grep` on log files, small read-only probes, `git`, editing code.
+- **LSF job scripts** must use **absolute paths** to repo scripts and data (`$PROJECT_ROOT/...`) because LSF may run the job script from a **spool directory**, not the submission cwd.
+- **Monitor** jobs the user cares about (`bjobs`, log tails) after submit unless they say not to.

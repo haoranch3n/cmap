@@ -1,0 +1,54 @@
+#!/bin/bash
+#BSUB -J fzcrop[1-1]
+# Paths relative to submission cwd (use: cd "$CMAP_ROOT" && bsub < ...).
+#BSUB -oo scripts/batch_full_z_crop/logs/fz_%J_%I.out
+#BSUB -eo scripts/batch_full_z_crop/logs/fz_%J_%I.err
+#BSUB -n 4
+#BSUB -R "rusage[mem=32000] span[hosts=1]"
+#BSUB -W 12:00
+#BSUB -q standard
+#BSUB -u /dev/null
+#
+# Before submitting:
+#   1) Generate the sample-paths list:
+#        python scripts/batch_crop_cells_full_z.py --output-root /path/to/output \
+#          --write-list logs/full_z_crop_paths.txt
+#   2) Replace [1-1] with [1-N] where N = number of lines in the list
+#   3) Edit -q, -R, -W for your site
+#
+# Submit from repo root:
+#   cd "$CMAP_ROOT"
+#   export PATHS_FILE="$PWD/logs/full_z_crop_paths.txt"
+#   N=$(wc -l < "$PATHS_FILE")
+#   bsub -J "fzcrop[1-$N]" -env "all,PATHS_FILE=$PATHS_FILE" \
+#     < scripts/batch_full_z_crop/array_job.lsf
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p "$SCRIPT_DIR/logs"
+CMAP_ROOT="${CMAP_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+export CMAP_ROOT
+cd "$CMAP_ROOT"
+export PYTHONUNBUFFERED=1
+
+if [[ -f "$SCRIPT_DIR/env.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/env.sh"
+fi
+
+PATHS_FILE="${PATHS_FILE:?PATHS_FILE must point to the sample list (one absolute dir per line)}"
+if [[ ! -f "$PATHS_FILE" ]]; then
+  echo "ERROR: PATHS_FILE not found: $PATHS_FILE" >&2
+  exit 1
+fi
+
+IDX="${LSB_JOBINDEX:?}"
+OUTDIR="$(awk -v "l=$IDX" 'NF { c++; if (c == l) { print; exit } }' "$PATHS_FILE")"
+if [[ -z "${OUTDIR}" ]]; then
+  echo "Task ${IDX}: empty line (past end of list); exiting 0"
+  exit 0
+fi
+
+echo "Array task ${IDX} -> ${OUTDIR}"
+exec bash "$SCRIPT_DIR/run_one_sample.sh" "$OUTDIR"

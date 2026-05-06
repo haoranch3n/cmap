@@ -11,6 +11,15 @@ Keep only 642nm nuclei that overlap with both 488nm AND 560nm masks
 - ``<output>/filtered_642_combined.tif`` — 4-channel OME BigTIFF (Z, C, Y, X):
   642 / 488 / 560 originals + filtered mask. Use ``--skip-combined`` to skip (large file).
 
+With ``--export-all-anchors``, also write the same triple-overlap rule with 560nm or
+488nm as the anchor (``filtered_560.tif``, ``filtered_488.tif``, and matching
+``*_3D_indexed_filtered.tif`` under each crop tree). Downstream steps still use 642
+by default.
+
+Passthrough from ``pipelines/run_analysis_pipeline.py``::
+
+    --passthrough --data-rel <rel> --export-all-anchors
+
 A 642 label is kept only if at least one of its voxels overlaps a labelled
 voxel in the 488 mask AND at least one overlaps a labelled voxel in the
 560 mask.
@@ -35,6 +44,9 @@ except ModuleNotFoundError:
     from config import DATA_DIR, OUTPUT_DIR, PROJECT_ROOT
 
 CHANNELS = ["642nm_crop", "488nm_crop", "560nm_crop"]
+
+# channel folder name -> short stem for filtered_<stem>.tif at merge root
+_CHANNEL_TO_SHORT_TIFF = {"642nm_crop": "642", "488nm_crop": "488", "560nm_crop": "560"}
 
 
 def _find_original_volume(data_dir: Path, stem: str) -> Path:
@@ -93,29 +105,49 @@ def _find_indexed_mask(output_dir: Path, ch: str) -> Path:
     return matches[0]
 
 
-def filter_642_mask(mask_642: np.ndarray, mask_488: np.ndarray, mask_560: np.ndarray) -> np.ndarray:
-    fg_488 = mask_488 > 0
-    fg_560 = mask_560 > 0
-    labels_overlap_488 = set(np.unique(mask_642[fg_488]))
-    labels_overlap_560 = set(np.unique(mask_642[fg_560]))
-    labels_overlap_488.discard(0)
-    labels_overlap_560.discard(0)
-    labels_to_keep = labels_overlap_488 & labels_overlap_560
+def filter_anchor_by_other_two(
+    anchor: np.ndarray,
+    other_a: np.ndarray,
+    other_b: np.ndarray,
+    *,
+    anchor_label: str,
+    other_a_label: str,
+    other_b_label: str,
+) -> np.ndarray:
+    """Keep anchor labels that overlap foreground in both other_a and other_b."""
+    fg_a = other_a > 0
+    fg_b = other_b > 0
+    labels_overlap_a = set(np.unique(anchor[fg_a]))
+    labels_overlap_b = set(np.unique(anchor[fg_b]))
+    labels_overlap_a.discard(0)
+    labels_overlap_b.discard(0)
+    labels_to_keep = labels_overlap_a & labels_overlap_b
 
-    all_labels = set(np.unique(mask_642))
+    all_labels = set(np.unique(anchor))
     all_labels.discard(0)
     total = len(all_labels)
-    print(f"  642 mask: {total} labels total")
-    print(f"    overlap with 488: {len(labels_overlap_488)}")
-    print(f"    overlap with 560: {len(labels_overlap_560)}")
+    print(f"  {anchor_label} mask: {total} labels total")
+    print(f"    overlap with {other_a_label}: {len(labels_overlap_a)}")
+    print(f"    overlap with {other_b_label}: {len(labels_overlap_b)}")
     print(f"    overlap with both (kept): {len(labels_to_keep)}")
     print(f"    removed: {total - len(labels_to_keep)}")
 
-    filtered = mask_642.copy()
+    filtered = anchor.copy()
     if labels_to_keep != all_labels:
         remove_mask = ~np.isin(filtered, [0] + list(labels_to_keep))
         filtered[remove_mask] = 0
     return filtered
+
+
+def filter_642_mask(mask_642: np.ndarray, mask_488: np.ndarray, mask_560: np.ndarray) -> np.ndarray:
+    return filter_anchor_by_other_two(
+        mask_642,
+        mask_488,
+        mask_560,
+        anchor_label="642",
+        other_a_label="488",
+        other_b_label="560",
+    )
 
 
 def _crop_zyx_to_ref(arr: np.ndarray, ref: tuple[int, int, int], label: str) -> np.ndarray:
@@ -127,7 +159,52 @@ def _crop_zyx_to_ref(arr: np.ndarray, ref: tuple[int, int, int], label: str) -> 
     return arr[:rz]
 
 
-def run(data_dir: Path, output_dir: Path, force: bool = False, skip_combined: bool = False) -> int:
+def _write_filtered_volume_pair(
+    output_dir: Path,
+    ch_folder: str,
+    filtered: np.ndarray,
+    force: bool,
+) -> None:
+    """Write ``<ch>_3D_indexed_filtered.tif`` and ``filtered_<short>.tif``."""
+    short = _CHANNEL_TO_SHORT_TIFF[ch_folder]
+    filtered_out = output_dir / ch_folder / "segmentation_3D_masks" / f"{ch_folder}_3D_indexed_filtered.tif"
+    filtered_short = output_dir / f"filtered_{short}.tif"
+
+    if not filtered_out.exists() or force:
+        filtered_out.parent.mkdir(parents=True, exist_ok=True)
+        tmp_filtered = str(filtered_out) + ".tmp"
+        tifffile.imwrite(
+            tmp_filtered,
+            filtered.astype(np.uint16),
+            photometric="minisblack",
+            compression="zlib",
+            metadata={"axes": "ZYX"},
+        )
+        os.replace(tmp_filtered, str(filtered_out))
+    else:
+        print(f"SKIP (exists): {filtered_out}")
+
+    if not filtered_short.exists() or force:
+        tmp_short = str(filtered_short) + ".tmp"
+        tifffile.imwrite(
+            tmp_short,
+            filtered.astype(np.uint16),
+            photometric="minisblack",
+            compression="zlib",
+            metadata={"axes": "ZYX"},
+        )
+        os.replace(tmp_short, str(filtered_short))
+    else:
+        print(f"SKIP (exists): {filtered_short}")
+
+
+def run(
+    data_dir: Path,
+    output_dir: Path,
+    force: bool = False,
+    skip_combined: bool = False,
+    export_all_anchors: bool = False,
+) -> int:
     print(f"Data dir:   {data_dir}")
     print(f"Output dir: {output_dir}")
     masks: dict[str, np.ndarray] = {}
@@ -157,37 +234,33 @@ def run(data_dir: Path, output_dir: Path, force: bool = False, skip_combined: bo
     remaining = len(np.unique(filtered_mask)) - 1
     print(f"  Remaining labels in filtered 642 mask: {remaining}\n")
 
-    ch642 = CHANNELS[0]
-    filtered_out = output_dir / ch642 / "segmentation_3D_masks" / f"{ch642}_3D_indexed_filtered.tif"
-    filtered_short = output_dir / "filtered_642.tif"
     ref_shape = filtered_mask.shape
+    _write_filtered_volume_pair(output_dir, "642nm_crop", filtered_mask, force)
 
-    if not filtered_out.exists() or force:
-        filtered_out.parent.mkdir(parents=True, exist_ok=True)
-        tmp_filtered = str(filtered_out) + ".tmp"
-        tifffile.imwrite(
-            tmp_filtered,
-            filtered_mask.astype(np.uint16),
-            photometric="minisblack",
-            compression="zlib",
-            metadata={"axes": "ZYX"},
+    if export_all_anchors:
+        print("\nFiltering 560 mask (overlap with 488 and 642)...")
+        f560 = filter_anchor_by_other_two(
+            masks["560nm_crop"],
+            masks["488nm_crop"],
+            masks["642nm_crop"],
+            anchor_label="560",
+            other_a_label="488",
+            other_b_label="642",
         )
-        os.replace(tmp_filtered, str(filtered_out))
-    else:
-        print(f"SKIP (exists): {filtered_out}")
+        print(f"  Remaining labels in filtered 560 mask: {len(np.unique(f560)) - 1}\n")
+        _write_filtered_volume_pair(output_dir, "560nm_crop", f560, force)
 
-    if not filtered_short.exists() or force:
-        tmp_short = str(filtered_short) + ".tmp"
-        tifffile.imwrite(
-            tmp_short,
-            filtered_mask.astype(np.uint16),
-            photometric="minisblack",
-            compression="zlib",
-            metadata={"axes": "ZYX"},
+        print("\nFiltering 488 mask (overlap with 560 and 642)...")
+        f488 = filter_anchor_by_other_two(
+            masks["488nm_crop"],
+            masks["560nm_crop"],
+            masks["642nm_crop"],
+            anchor_label="488",
+            other_a_label="560",
+            other_b_label="642",
         )
-        os.replace(tmp_short, str(filtered_short))
-    else:
-        print(f"SKIP (exists): {filtered_short}")
+        print(f"  Remaining labels in filtered 488 mask: {len(np.unique(f488)) - 1}\n")
+        _write_filtered_volume_pair(output_dir, "488nm_crop", f488, force)
 
     combined_out = output_dir / "filtered_642_combined.tif"
     if skip_combined:
@@ -239,11 +312,21 @@ def main() -> int:
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--force", action="store_true", help="Overwrite existing output")
     ap.add_argument("--skip-combined", action="store_true", help="Do not write filtered_642_combined.tif")
+    ap.add_argument(
+        "--export-all-anchors",
+        action="store_true",
+        help="Also write filtered_560.tif / filtered_488.tif (triple overlap, same rule as 642)",
+    )
     args = ap.parse_args()
     data_dir, output_dir = _resolve_dirs(args)
-    return run(data_dir, output_dir, force=args.force, skip_combined=args.skip_combined)
+    return run(
+        data_dir,
+        output_dir,
+        force=args.force,
+        skip_combined=args.skip_combined,
+        export_all_anchors=args.export_all_anchors,
+    )
 
 
 if __name__ == "__main__":
     sys.exit(main())
-

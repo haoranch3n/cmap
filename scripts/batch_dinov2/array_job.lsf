@@ -1,0 +1,47 @@
+#!/bin/bash
+#BSUB -J dinov2_emb[1-1]
+# Paths relative to submission cwd (use: cd "$CMAP_ROOT" && bsub < ...).
+#BSUB -oo scripts/batch_dinov2/logs/dv2_%J_%I.out
+#BSUB -eo scripts/batch_dinov2/logs/dv2_%J_%I.err
+#BSUB -n 8
+#BSUB -W 4:00
+##BSUB -q gpu
+##BSUB -gpu "num=1:j_exclusive=yes"
+##BSUB -R "rusage[mem=65536]"
+#
+# Before submitting:
+#   1) mkdir -p scripts/batch_dinov2/logs
+#   2) Put one sample name per line in scripts/batch_dinov2/samples.txt
+#   3) Replace [1-1] with [1-N] where N = number of non-comment lines
+#   4) Uncomment / edit -q, -gpu, -R for your site
+#
+# Submit from repo root:
+#   cd "$CMAP_ROOT" && bsub < scripts/batch_dinov2/array_job.lsf
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+mkdir -p "$SCRIPT_DIR/logs"
+CMAP_ROOT="${CMAP_ROOT:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+export CMAP_ROOT
+
+SAMPLES_FILE="${SAMPLES_FILE:-$SCRIPT_DIR/samples.txt}"
+if [[ ! -f "$SAMPLES_FILE" ]]; then
+  echo "ERROR: SAMPLES_FILE not found: $SAMPLES_FILE" >&2
+  exit 1
+fi
+
+if [[ -f "$SCRIPT_DIR/env.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/env.sh"
+fi
+
+IDX="${LSB_JOBINDEX:?}"
+SAMPLE="$(awk -v "l=$IDX" 'NF && !/^[[:space:]]*#/ { c++; if (c == l) { print $1; exit } }' "$SAMPLES_FILE")"
+if [[ -z "${SAMPLE:-}" ]]; then
+  echo "ERROR: no sample at LSB_JOBINDEX=$IDX in $SAMPLES_FILE" >&2
+  exit 1
+fi
+
+echo "LSB_JOBINDEX=$IDX -> sample '$SAMPLE'"
+exec bash "$SCRIPT_DIR/run_one_sample.sh" "$SAMPLE"

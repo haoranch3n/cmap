@@ -13,3 +13,17 @@ napari-plugin/
 # Archived legacy trees are kept on disk for reference but are too large
 # for normal git history; see archive/README.md
 archive/legacy_modules/
+
+# Run/job logs (transient, often large)
+logs/
+**/logs/
+*.out
+*.err
+cufile.log
+
+# Pre-migration legacy tree kept on disk for reference (too large for git history)
+segmentation_multiscale_cellpose_3D/
+
+# Editor / OS noise
+*.tmp
+.DS_Store

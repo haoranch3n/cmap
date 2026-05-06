@@ -34,6 +34,15 @@ visualizationModule --> plotsReports[PlotsAndReports]
 napariPluginModule --> interactiveReview[InteractiveReview]
 ```
 
+## Optional: DINOv2 deep embeddings
+
+`features/dinov2/` adds an optional frozen DINOv2 ViT-B/14 (2.5D) encoder
+that produces a 768-D vector per cell from the existing
+`cell_boxing/cell_*.tif` crops. It is wired into the orchestrator behind
+`pipelines/run_analysis_pipeline.py --run-dinov2` (and
+`--run-dinov2-vis` for the pooled UMAP step under `cell_qc_all/`). See
+`features/dinov2/README.md` for details.
+
 ## Transitional Note
 
 `segmentation/`, `postprocess/`, `features/`, `qc/`, and `visualization/` now

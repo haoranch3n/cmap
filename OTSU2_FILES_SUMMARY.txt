@@ -1,0 +1,65 @@
+OTSU2 THRESHOLDING IMPLEMENTATION - FILES SUMMARY
+================================================
+
+MODIFIED FILES:
+1. qc/filter_by_intensity.py
+   - Added otsu2 method recognition in _parse_method()
+   - Added otsu2 threshold logic in _compute_threshold()
+   - Added otsu2 support in _compute_pixel_thresholds_from_volume()
+   - Modified run_from_volume() to use method-specific output column names
+   - Key change: Otsu2 clips intensity to 0-99.99th percentile before computing Otsu threshold
+
+NEW UTILITY SCRIPTS:
+1. qc/compare_otsu2_methods_separate.py
+   - Compares Otsu vs Otsu2 results from separate CSV files
+   - Shows statistics, thresholds, and filtered mask cell counts
+   
+2. qc/create_otsu2_shape_filtered_mask.py
+   - Creates filtered_642_pass_otsu2_shape.tif from pass_otsu2_shape column
+   - Output format: {mask_name}_pass_otsu2_shape.tif
+
+LSF TEST SCRIPTS:
+1. qc/bsub_otsu2_large.sh
+   - Tests Otsu2 on large 2.8GB sample
+   - Requires 10GB memory
+   - Creates comparison report
+
+2. qc/bsub_final_otsu2_test.sh
+   - Comprehensive test with smaller fallback sample
+   - Auto-detects and uses available sample
+
+DOCUMENTATION:
+1. OTSU2_IMPLEMENTATION_SUMMARY.md
+   - Complete technical documentation
+   - Usage instructions
+   - Method comparison
+   - Test requirements
+
+2. OTSU2_TEST_RESULTS.md
+   - Test results and findings
+   - Integration guidelines
+   - Next steps
+
+TESTED SAMPLE:
+- _smoke_crop_demo: ✓ PASSED (1 cell, 93KB TIFF)
+  - Both methods passed
+  - Generated filtered_642_pass_otsu2_shape.tif successfully
+  - Comparison script working correctly
+
+COMMAND LINE USAGE:
+# Test otsu2 on a sample
+python qc/filter_by_intensity.py --from-volume --method otsu2 \
+  --variant filtered_642 --output-dir /path/to/sample --force
+
+# Output: CSV with pass_otsu2_shape column
+
+# Create filtered mask
+python qc/create_otsu2_shape_filtered_mask.py /path/to/sample \
+  /path/to/sample/cell_qc/qc_features_filtered_otsu2.csv
+
+# Output: filtered_642_pass_otsu2_shape.tif
+
+# Compare methods
+python qc/compare_otsu2_methods_separate.py /path/to/sample
+
+# Outputs comparison statistics and analysis

@@ -1,0 +1,10 @@
+---
+description: CMAP pipeline paths, env vars, and module layout
+alwaysApply: true
+---
+
+# CMAP pipeline
+
+Before changing paths, imports, or orchestration, read **`pipeline-context.md`** at the repository root (`cmap/pipeline-context.md`).
+
+Summary: default artifacts live in **`output/`** at repo root; override with **`PIPELINE_OUTPUT_DIR`** (and **`PIPELINE_DATA_DIR`** for inputs). The napari plugin and its `scripts/` helpers expect the same output root—never hardcode `segmentation_multiscale_cellpose_3D/output`. Legacy trees live under **`archive/legacy_modules/`** and are not the active pipeline.

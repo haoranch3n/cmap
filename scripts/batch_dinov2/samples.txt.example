@@ -1,0 +1,5 @@
+# One sample folder name per line (same string you pass to --data-rel).
+# These are immediate children of PIPELINE_OUTPUT_DIR that contain cell_boxing/.
+#
+# CGNSample1_Position0_decon_dsr
+# CGNSample2_Position0_decon_dsr

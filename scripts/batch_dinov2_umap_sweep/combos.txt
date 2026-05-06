@@ -1,0 +1,12 @@
+5 0.0 cosine
+5 0.0 euclidean
+5 0.1 cosine
+5 0.1 euclidean
+15 0.0 cosine
+15 0.0 euclidean
+15 0.1 cosine
+15 0.1 euclidean
+30 0.0 cosine
+30 0.0 euclidean
+30 0.1 cosine
+30 0.1 euclidean

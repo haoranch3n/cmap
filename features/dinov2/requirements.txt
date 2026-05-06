@@ -1,0 +1,13 @@
+# Optional dependencies for the DINOv2 cell-embedding subpackage.
+#
+# The rest of the CMAP pipeline does not require torch, so these are kept
+# scoped here. Install the ones you need; CUDA wheels are picked up
+# automatically on most systems.
+torch>=2.0
+torchvision>=0.15
+tifffile>=2023.7.10
+numpy>=1.24
+scipy>=1.9.0
+# For visualization/dinov2_visualize.py
+umap-learn>=0.5
+pandas>=2.0

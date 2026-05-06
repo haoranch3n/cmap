@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
 Filter cells by per-channel mean intensity and append pass/fail to QC CSV.
+
+With ``--from-volume``, optional 3D shape gates (bbox aspect, fill ratio,
+inertia anisotropy, two-step erosion split count) run first; labels that fail
+receive ``pass_shape=0`` and ``pass_qc`` is zero even if Otsu intensity would
+pass (so ``apply_qc_pass_to_label_mask.py`` drops them). ``pass_qc`` is 1 only
+when both the per-channel volume Otsu pixel gates and ``pass_shape`` pass.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+from dataclasses import dataclass
 import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import tifffile
+from scipy import ndimage
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
@@ -22,8 +30,97 @@ try:
 except ModuleNotFoundError:
     from config import DATA_DIR, OUTPUT_DIR, PROJECT_ROOT
 
+from postprocess import DEFAULT_VARIANT, VALID_VARIANTS, variant_files
+
 CHANNEL_NAMES = ["642", "488", "560"]
 CHANNEL_INDICES = {name: idx for idx, name in enumerate(CHANNEL_NAMES)}
+
+
+@dataclass(frozen=True)
+class ShapeFilterParams:
+    """3D morphology gate (before Otsu pixel gates are combined into pass_qc)."""
+
+    enabled: bool
+    max_bbox_aspect: float
+    min_fill_ratio: float
+    max_inertia_ratio: float
+    min_vol_erode_test: int
+    min_vol_skip_all: int
+    erode_iterations: int
+
+
+def _shape_metrics_3d(bin3d: np.ndarray, erode_iterations: int = 2) -> dict[str, float]:
+    """Cheap 3D shape descriptors on a boolean bbox crop (single label)."""
+    v = float(int(bin3d.sum()))
+    dz, dy, dx = bin3d.shape
+    bbox_vol = float(max(dz * dy * dx, 1))
+    edges = np.array([dz, dy, dx], dtype=np.float64)
+    smin = max(float(edges.min()), 1.0)
+    smax = float(edges.max())
+    bbox_aspect = smax / smin
+    fill_ratio = v / bbox_vol
+
+    coords = np.argwhere(bin3d)
+    if coords.shape[0] < 4:
+        inertia_ratio = 1.0
+    else:
+        c = coords.astype(np.float64)
+        c -= c.mean(axis=0, keepdims=True)
+        cov = (c.T @ c) / float(c.shape[0])
+        ev = np.linalg.eigvalsh(cov)
+        ev = np.sort(ev)[::-1]
+        inertia_ratio = float(ev[0] / max(ev[2], 1e-12))
+
+    struct = ndimage.generate_binary_structure(3, 1)
+    er = bin3d.astype(bool, copy=False)
+    for _ in range(max(erode_iterations, 0)):
+        er = ndimage.binary_erosion(er, structure=struct)
+    if not er.any():
+        erode_n_cc = 0.0
+    else:
+        _, erode_n_cc = ndimage.label(er, structure=struct)
+        erode_n_cc = float(erode_n_cc)
+
+    return {
+        "shape_volume": v,
+        "shape_bbox_aspect": float(bbox_aspect),
+        "shape_fill_ratio": float(fill_ratio),
+        "shape_inertia_ratio": float(inertia_ratio),
+        "shape_erode2_n_cc": erode_n_cc,
+    }
+
+
+def _pass_shape(m: dict[str, float], p: ShapeFilterParams) -> bool:
+    v = int(m["shape_volume"])
+    if not p.enabled or v < p.min_vol_skip_all:
+        return True
+
+    if m["shape_bbox_aspect"] > p.max_bbox_aspect:
+        return False
+    if m["shape_fill_ratio"] < p.min_fill_ratio:
+        return False
+    if m["shape_inertia_ratio"] > p.max_inertia_ratio:
+        return False
+
+    if v >= p.min_vol_erode_test:
+        ncc = int(round(m["shape_erode2_n_cc"]))
+        if ncc >= 2:
+            return False
+        if ncc == 0:
+            return False
+
+    return True
+
+
+DEFAULT_SHAPE_PARAMS = ShapeFilterParams(
+    enabled=True,
+    max_bbox_aspect=16.0,
+    min_fill_ratio=0.045,
+    max_inertia_ratio=20.0,
+    min_vol_erode_test=400,
+    min_vol_skip_all=50,
+    erode_iterations=2,
+)
 
 
 def _resolve_dirs(args) -> tuple[Path, Path]:
@@ -47,6 +144,8 @@ def _parse_method(method_str: str) -> tuple[str, float | None]:
         return "log_otsu", None
     if method_str == "otsu":
         return "otsu", None
+    if method_str == "otsu2":
+        return "otsu2", None
     if method_str.startswith("percentile:"):
         val = float(method_str.split(":", 1)[1])
         if not 0 < val < 100:
@@ -54,7 +153,7 @@ def _parse_method(method_str: str) -> tuple[str, float | None]:
         return "percentile", val
     if method_str.startswith("fixed:"):
         return "fixed", float(method_str.split(":", 1)[1])
-    raise ValueError("Unknown method. Use 'log_otsu', 'otsu', 'percentile:N', or 'fixed:V'.")
+    raise ValueError("Unknown method. Use 'log_otsu', 'otsu', 'otsu2', 'percentile:N', or 'fixed:V'.")
 
 
 def _compute_threshold(values: np.ndarray, method: str, param: float | None) -> float:
@@ -73,6 +172,12 @@ def _compute_threshold(values: np.ndarray, method: str, param: float | None) -> 
     if method == "otsu":
         try:
             return float(threshold_otsu(values))
+        except ValueError:
+            return 0.0
+    if method == "otsu2":
+        clipped = np.clip(values, 0, np.percentile(values, 99.99))
+        try:
+            return float(threshold_otsu(clipped))
         except ValueError:
             return 0.0
     if method == "percentile":
@@ -117,8 +222,201 @@ def _compute_pixel_thresholds(box_dir: Path) -> dict[str, float]:
     return thresholds
 
 
-def run(output_dir: Path, method_str: str = "otsu", force: bool = False) -> int:
-    qc_dir = output_dir / "cell_qc"
+def _compute_pixel_thresholds_from_volume(
+    combined_zcyx: np.ndarray, mask: np.ndarray, method: str = "log_otsu"
+) -> dict[str, float]:
+    """Apply thresholding method on positive voxels under label foreground."""
+    from skimage.filters import threshold_otsu
+
+    thresholds: dict[str, float] = {}
+    fg = mask > 0
+    for ch_name, ch_idx in CHANNEL_INDICES.items():
+        vals = combined_zcyx[:, ch_idx, :, :][fg].astype(np.float64).ravel()
+        pos = vals[vals > 0]
+        if len(pos) < 2:
+            thresholds[ch_name] = 0.0
+            continue
+        try:
+            if method == "log_otsu":
+                thresholds[ch_name] = float(np.exp(float(threshold_otsu(np.log(pos)))))
+            elif method == "otsu2":
+                clipped = np.clip(pos, 0, np.percentile(pos, 99.99))
+                thresholds[ch_name] = float(threshold_otsu(clipped))
+            else:
+                thresholds[ch_name] = float(np.exp(float(threshold_otsu(np.log(pos)))))
+        except ValueError:
+            thresholds[ch_name] = 0.0
+    return thresholds
+
+
+def run_from_volume(
+    output_dir: Path,
+    method_str: str = "log_otsu",
+    force: bool = False,
+    variant: str = DEFAULT_VARIANT,
+    shape_params: ShapeFilterParams | None = None,
+) -> int:
+    """Intensity QC from variant mask + combined TIFF (no cell crops required)."""
+    sp = shape_params or DEFAULT_SHAPE_PARAMS
+    v = variant_files(variant)
+    print(
+        f"Variant: {variant}  --from-volume  (mask={v['mask']}, combined={v['combined']})"
+    )
+    if sp.enabled:
+        print(
+            "  shape_filter: on  "
+            f"max_bbox_aspect={sp.max_bbox_aspect}  min_fill={sp.min_fill_ratio}  "
+            f"max_inertia={sp.max_inertia_ratio}  min_vol_erode={sp.min_vol_erode_test}  "
+            f"min_vol_skip={sp.min_vol_skip_all}  erode_iter={sp.erode_iterations}"
+        )
+    else:
+        print("  shape_filter: off")
+    qc_dir = output_dir / v["cell_qc"]
+    output_csv = qc_dir / "qc_features_filtered.csv"
+    if output_csv.exists() and not force:
+        print(f"SKIP (exists): {output_csv}  (use --force to overwrite)")
+        return 0
+
+    mask_path = output_dir / v["mask"]
+    combined_path = output_dir / v["combined"]
+    if not mask_path.is_file():
+        print(f"ERROR: mask not found: {mask_path}")
+        return 1
+    if not combined_path.is_file():
+        print(f"ERROR: combined not found: {combined_path}")
+        return 1
+
+    mask = tifffile.imread(str(mask_path))
+    if mask.ndim == 4:
+        mask = mask[:, 0]
+    if mask.ndim != 3:
+        print(f"ERROR: expected 3-D mask, got {mask.shape}")
+        return 1
+    mask_i = mask.astype(np.int32, copy=False)
+
+    combined = tifffile.imread(str(combined_path))
+    if combined.ndim != 4 or combined.shape[1] < 3:
+        print(f"ERROR: expected (Z, C>=3, Y, X) combined, got {combined.shape}")
+        return 1
+    z_min = min(mask_i.shape[0], combined.shape[0])
+    mask_i = mask_i[:z_min]
+    combined = combined[:z_min]
+
+    label_ids = np.unique(mask_i)
+    label_ids = label_ids[label_ids > 0]
+    if label_ids.size == 0:
+        print("ERROR: mask has no positive labels")
+        return 1
+
+    rows: list[dict[str, float | int]] = [
+        {"cell_id": int(lid)} for lid in label_ids
+    ]
+    for ch_name, ch_idx in CHANNEL_INDICES.items():
+        slab = combined[:, ch_idx, :, :].astype(np.float64, copy=False)
+        means = ndimage.mean(slab, labels=mask_i, index=label_ids)
+        for i in range(len(label_ids)):
+            rows[i][f"mean_{ch_name}"] = float(means[i])
+
+    method, param = _parse_method(method_str)
+    thresholds: dict[str, float] = {}
+    for ch in CHANNEL_NAMES:
+        values = np.array([float(r[f"mean_{ch}"]) for r in rows], dtype=np.float64)
+        thresholds[ch] = _compute_threshold(values, method, param)
+
+    px_thresholds = _compute_pixel_thresholds_from_volume(combined, mask_i, method=method)
+
+    max_lab = int(mask_i.max())
+    label_slices = ndimage.find_objects(mask_i, max_lab)
+
+    str_rows: list[dict[str, str]] = []
+    n_shape_fail = 0
+    n_px_fail = 0
+    
+    method_suffix = "otsu2" if method == "otsu2" else "otsu"
+    
+    for row in rows:
+        cid = int(row["cell_id"])
+        out: dict[str, str] = {"cell_id": str(cid)}
+        if 0 < cid <= max_lab and label_slices[cid - 1] is not None:
+            slc = label_slices[cid - 1]
+            bin3d = mask_i[slc] == cid
+        else:
+            bin3d = mask_i == cid
+        sm = _shape_metrics_3d(bin3d, erode_iterations=sp.erode_iterations)
+        pass_shape = _pass_shape(sm, sp)
+        out["shape_volume"] = str(int(sm["shape_volume"]))
+        out["shape_bbox_aspect"] = str(round(sm["shape_bbox_aspect"], 4))
+        out["shape_fill_ratio"] = str(round(sm["shape_fill_ratio"], 6))
+        out["shape_inertia_ratio"] = str(round(sm["shape_inertia_ratio"], 4))
+        out["shape_erode2_n_cc"] = str(int(round(sm["shape_erode2_n_cc"])))
+        out["pass_shape"] = str(int(pass_shape))
+        if not pass_shape:
+            n_shape_fail += 1
+
+        all_pass = True
+        all_px_pass = True
+        for ch in CHANNEL_NAMES:
+            val = float(row[f"mean_{ch}"])
+            passed = int(val >= thresholds[ch])
+            out[f"mean_{ch}"] = str(round(val, 6))
+            out[f"threshold_{ch}"] = str(round(thresholds[ch], 4))
+            out[f"pass_{ch}"] = str(passed)
+            if not passed:
+                all_pass = False
+
+            px_passed = int(val >= px_thresholds[ch])
+            out[f"px_threshold_{ch}"] = str(round(px_thresholds[ch], 4))
+            out[f"px_pass_{ch}"] = str(px_passed)
+            if not px_passed:
+                all_px_pass = False
+        out["pass_intensity"] = str(int(all_pass))
+        px_only = int(all_px_pass)
+        if px_only == 0:
+            n_px_fail += 1
+        out[f"pass_{method_suffix}_shape"] = str(int(px_only and pass_shape))
+        str_rows.append(out)
+
+    shape_cols = [
+        "shape_volume",
+        "shape_bbox_aspect",
+        "shape_fill_ratio",
+        "shape_inertia_ratio",
+        "shape_erode2_n_cc",
+        "pass_shape",
+    ]
+    tail_cols: list[str] = []
+    for ch in CHANNEL_NAMES:
+        tail_cols.extend(
+            [f"threshold_{ch}", f"pass_{ch}", f"px_threshold_{ch}", f"px_pass_{ch}"]
+        )
+    tail_cols.extend(["pass_intensity", f"pass_{method_suffix}_shape"])
+    base_cols = ["cell_id", "mean_642", "mean_488", "mean_560"]
+    fieldnames = base_cols + shape_cols + tail_cols
+    print(
+        f"  shape: failed={n_shape_fail}  intensity_px_failed={n_px_fail}  "
+        f"pass_mask={sum(int(r[f'pass_{method_suffix}_shape']) for r in str_rows)}/{len(str_rows)}"
+    )
+
+    qc_dir.mkdir(parents=True, exist_ok=True)
+    tmp = str(output_csv) + ".tmp"
+    with open(tmp, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(str_rows)
+    os.replace(tmp, str(output_csv))
+    print(f"Wrote {output_csv}  ({len(str_rows)} cells, precrop pass columns only)")
+    return 0
+
+
+def run(
+    output_dir: Path,
+    method_str: str = "otsu",
+    force: bool = False,
+    variant: str = DEFAULT_VARIANT,
+) -> int:
+    v = variant_files(variant)
+    print(f"Variant: {variant}  (cell_box={v['cell_box']}, cell_qc={v['cell_qc']})")
+    qc_dir = output_dir / v["cell_qc"]
     input_csv = qc_dir / "qc_features.csv"
     output_csv = qc_dir / "qc_features_filtered.csv"
     if not input_csv.exists():
@@ -140,7 +438,7 @@ def run(output_dir: Path, method_str: str = "otsu", force: bool = False) -> int:
         values = np.array([float(r[f"mean_{ch}"]) for r in rows], dtype=np.float64)
         thresholds[ch] = _compute_threshold(values, method, param)
 
-    box_dir = output_dir / "cell_boxing"
+    box_dir = output_dir / v["cell_box"]
     px_thresholds = _compute_pixel_thresholds(box_dir)
 
     for row in rows:
@@ -160,12 +458,12 @@ def run(output_dir: Path, method_str: str = "otsu", force: bool = False) -> int:
             if not px_passed:
                 all_px_pass = False
         row["pass_intensity"] = int(all_pass)
-        row["pass_pixel_intensity"] = int(all_px_pass)
+        row["pass_qc"] = int(all_px_pass)
 
     new_cols = []
     for ch in CHANNEL_NAMES:
         new_cols.extend([f"threshold_{ch}", f"pass_{ch}", f"px_threshold_{ch}", f"px_pass_{ch}"])
-    new_cols.extend(["pass_intensity", "pass_pixel_intensity"])
+    new_cols.extend(["pass_intensity", "pass_qc"])
     original_cols = list(rows[0].keys())
     fieldnames = [c for c in original_cols if c not in new_cols] + new_cols
 
@@ -186,9 +484,53 @@ def main() -> int:
     ap.add_argument("--output-dir", type=Path, default=None)
     ap.add_argument("--method", type=str, default="log_otsu")
     ap.add_argument("--force", action="store_true", help="Overwrite existing output")
+    ap.add_argument(
+        "--from-volume",
+        action="store_true",
+        help=(
+            "Compute per-cell means and Otsu pass columns from variant mask + combined "
+            "TIFF only (no qc_features.csv or cell_boxing required). Writes precrop "
+            "qc_features_filtered.csv for apply_qc_pass_to_label_mask.py."
+        ),
+    )
+    ap.add_argument(
+        "--variant",
+        choices=VALID_VARIANTS,
+        default=DEFAULT_VARIANT,
+        help=f"Mask variant whose cell_box/cell_qc dirs to use (default: {DEFAULT_VARIANT})",
+    )
+    ap.add_argument(
+        "--shape-filter",
+        choices=("on", "off"),
+        default="on",
+        help="With --from-volume: drop non-compact 3D labels before Otsu gates feed pass_qc (default: on).",
+    )
+    ap.add_argument("--shape-max-bbox-aspect", type=float, default=DEFAULT_SHAPE_PARAMS.max_bbox_aspect)
+    ap.add_argument("--shape-min-fill", type=float, default=DEFAULT_SHAPE_PARAMS.min_fill_ratio)
+    ap.add_argument("--shape-max-inertia-ratio", type=float, default=DEFAULT_SHAPE_PARAMS.max_inertia_ratio)
+    ap.add_argument("--shape-min-vol-erode", type=int, default=DEFAULT_SHAPE_PARAMS.min_vol_erode_test)
+    ap.add_argument("--shape-min-vol-skip", type=int, default=DEFAULT_SHAPE_PARAMS.min_vol_skip_all)
+    ap.add_argument("--shape-erode-iterations", type=int, default=DEFAULT_SHAPE_PARAMS.erode_iterations)
     args = ap.parse_args()
     _, output_dir = _resolve_dirs(args)
-    return run(output_dir, method_str=args.method, force=args.force)
+    if args.from_volume:
+        sp = ShapeFilterParams(
+            enabled=args.shape_filter == "on",
+            max_bbox_aspect=args.shape_max_bbox_aspect,
+            min_fill_ratio=args.shape_min_fill,
+            max_inertia_ratio=args.shape_max_inertia_ratio,
+            min_vol_erode_test=args.shape_min_vol_erode,
+            min_vol_skip_all=args.shape_min_vol_skip,
+            erode_iterations=max(0, int(args.shape_erode_iterations)),
+        )
+        return run_from_volume(
+            output_dir,
+            method_str=args.method,
+            force=args.force,
+            variant=args.variant,
+            shape_params=sp,
+        )
+    return run(output_dir, method_str=args.method, force=args.force, variant=args.variant)
 
 
 if __name__ == "__main__":
