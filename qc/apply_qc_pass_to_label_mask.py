@@ -49,27 +49,44 @@ def _resolve_sample_dir(
     raise ValueError("need --sample-dir, --output-dir, or --data-rel")
 
 
-def _pass_qc_column(rows: list[dict[str, str]]) -> str:
+def _pass_qc_column(rows: list[dict[str, str]], explicit: str | None = None) -> str:
     if not rows:
         raise ValueError("CSV has no header row")
     keys = rows[0].keys()
-    if "pass_qc" in keys:
-        return "pass_qc"
-    if "pass_pixel_intensity" in keys:
-        return "pass_pixel_intensity"
+    if explicit is not None:
+        if explicit not in keys:
+            raise ValueError(
+                f"CSV missing requested pass column {explicit!r}; "
+                f"available columns: {sorted(keys)}"
+            )
+        return explicit
+    # Auto-detect order: prefer the most specific method-named columns first,
+    # then fall back to the legacy generic names.
+    for candidate in (
+        "pass_bg_sigma_shape",
+        "pass_otsu_or_bg_shape",
+        "pass_otsu2_shape",
+        "pass_otsu_shape",
+        "pass_qc",
+        "pass_pixel_intensity",
+    ):
+        if candidate in keys:
+            return candidate
     raise ValueError(
-        "CSV missing pass column: expected 'pass_qc' (or legacy 'pass_pixel_intensity')"
+        "CSV missing pass column: expected one of "
+        "pass_bg_sigma_shape / pass_otsu_or_bg_shape / pass_otsu2_shape / "
+        "pass_otsu_shape / pass_qc / pass_pixel_intensity"
     )
 
 
-def _load_keep_ids(csv_path: Path) -> tuple[set[int], str]:
+def _load_keep_ids(csv_path: Path, pass_column: str | None = None) -> tuple[set[int], str]:
     with open(csv_path, newline="") as fh:
         rows = list(csv.DictReader(fh))
     if not rows:
         raise ValueError(f"CSV has no rows: {csv_path}")
     if "cell_id" not in rows[0]:
         raise ValueError("CSV missing required column: 'cell_id'")
-    pass_col = _pass_qc_column(rows)
+    pass_col = _pass_qc_column(rows, explicit=pass_column)
     keep: set[int] = set()
     for row in rows:
         try:
@@ -118,6 +135,7 @@ def run_sample(
     output_name: str = "filtered_642_pass_otsu_shape.tif",
     overwrite: bool = False,
     dry_run: bool = False,
+    pass_column: str | None = None,
 ) -> int:
     sample_dir = sample_dir.resolve()
     mask_path = sample_dir / mask_name
@@ -134,7 +152,7 @@ def run_sample(
         print(f"SKIP (exists): {out_path}")
         return 0
 
-    keep_ids, pass_col = _load_keep_ids(csv_path)
+    keep_ids, pass_col = _load_keep_ids(csv_path, pass_column=pass_column)
     if not keep_ids:
         print(f"No cells with {pass_col} == 1; writing empty mask.")
     mask = tifffile.imread(mask_path)
@@ -179,6 +197,17 @@ def main() -> int:
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
+        "--pass-column",
+        type=str,
+        default=None,
+        help=(
+            "Explicit name of the pass-flag column in qc_features_filtered.csv "
+            "(e.g. pass_bg_sigma_shape, pass_otsu_or_bg_shape, pass_otsu2_shape, "
+            "pass_otsu_shape). Default: auto-detect, preferring the most-specific "
+            "method-named column."
+        ),
+    )
+    ap.add_argument(
         "--variant",
         choices=VALID_VARIANTS,
         default=DEFAULT_VARIANT,
@@ -212,6 +241,7 @@ def main() -> int:
             output_name=args.output_name,
             overwrite=args.overwrite,
             dry_run=args.dry_run,
+            pass_column=args.pass_column,
         )
 
     failed = 0
@@ -233,6 +263,7 @@ def main() -> int:
                 output_name=args.output_name,
                 overwrite=args.overwrite,
                 dry_run=args.dry_run,
+                pass_column=args.pass_column,
             )
             if rc != 0:
                 failed += 1

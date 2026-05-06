@@ -2,11 +2,26 @@
 """
 Filter cells by per-channel mean intensity and append pass/fail to QC CSV.
 
+Supported ``--method`` values:
+- ``log_otsu``         -- legacy default; Otsu over log-transformed positives.
+- ``otsu``             -- Otsu over raw values.
+- ``otsu2``            -- Otsu over values clipped to [0, p99.99].
+- ``bg_sigma:X``       -- ``T = bg_mean + X * bg_std`` per channel, with bg
+  estimated on the dilated-mask complement (un-clipped voxels, top P%
+  trimmed). Recommended primary method (X=3 on Sample7_Position7 cleanly
+  drops noise-floor cells like union_488_560 cell 25).
+- ``otsu_or_bg:X``     -- hybrid floor: ``T = max(log_otsu_T, bg_mean+X*bg_std)``.
+  Falls back to bg_sigma when log_otsu collapses; tightens to log_otsu when
+  it actually finds bimodality.
+- ``percentile:N`` / ``fixed:V`` -- legacy diagnostic options.
+
 With ``--from-volume``, optional 3D shape gates (bbox aspect, fill ratio,
 inertia anisotropy, two-step erosion split count) run first; labels that fail
-receive ``pass_shape=0`` and ``pass_qc`` is zero even if Otsu intensity would
-pass (so ``apply_qc_pass_to_label_mask.py`` drops them). ``pass_qc`` is 1 only
-when both the per-channel volume Otsu pixel gates and ``pass_shape`` pass.
+receive ``pass_shape=0`` and ``pass_<method>_shape`` stays 0 even when the
+intensity gate would pass (so ``apply_qc_pass_to_label_mask.py`` drops them).
+The ``pass_<method>_shape`` column is named after the chosen method
+(``pass_otsu_shape`` / ``pass_otsu2_shape`` / ``pass_bg_sigma_shape`` /
+``pass_otsu_or_bg_shape``).
 """
 from __future__ import annotations
 
@@ -146,6 +161,16 @@ def _parse_method(method_str: str) -> tuple[str, float | None]:
         return "otsu", None
     if method_str == "otsu2":
         return "otsu2", None
+    if method_str.startswith("bg_sigma:"):
+        val = float(method_str.split(":", 1)[1])
+        if val <= 0:
+            raise ValueError(f"bg_sigma X must be > 0, got {val}")
+        return "bg_sigma", val
+    if method_str.startswith("otsu_or_bg:"):
+        val = float(method_str.split(":", 1)[1])
+        if val <= 0:
+            raise ValueError(f"otsu_or_bg X must be > 0, got {val}")
+        return "otsu_or_bg", val
     if method_str.startswith("percentile:"):
         val = float(method_str.split(":", 1)[1])
         if not 0 < val < 100:
@@ -153,7 +178,10 @@ def _parse_method(method_str: str) -> tuple[str, float | None]:
         return "percentile", val
     if method_str.startswith("fixed:"):
         return "fixed", float(method_str.split(":", 1)[1])
-    raise ValueError("Unknown method. Use 'log_otsu', 'otsu', 'otsu2', 'percentile:N', or 'fixed:V'.")
+    raise ValueError(
+        "Unknown method. Use 'log_otsu', 'otsu', 'otsu2', "
+        "'bg_sigma:X', 'otsu_or_bg:X', 'percentile:N', or 'fixed:V'."
+    )
 
 
 def _compute_threshold(values: np.ndarray, method: str, param: float | None) -> float:
@@ -249,12 +277,97 @@ def _compute_pixel_thresholds_from_volume(
     return thresholds
 
 
+def _compute_background_stats(
+    combined_zcyx: np.ndarray,
+    mask: np.ndarray,
+    dilate_iters: int = 2,
+    top_clip_pct: float = 1.0,
+) -> dict[str, dict[str, float]]:
+    """Per-channel background mean/std over the (dilated) cell-mask complement.
+
+    Negative voxels are intentionally NOT clipped to 0: they carry information
+    about the real noise scale (deconvolution overshoot occurs in both
+    directions). Clipping the bg to >= 0 collapses bg_std and breaks any
+    bg_mean + X * bg_std threshold. See ``.cursor/plans/filter_dev.md``.
+
+    The top ``top_clip_pct`` percent of background voxels is dropped before
+    computing mean/std as a debris guard (autofluorescent pixels that survive
+    the dilated-complement). ``dilate_iters=2`` pulls the bg sample away from
+    cell edges to avoid signal bleed.
+    """
+    fg = mask > 0
+    if dilate_iters > 0:
+        struct = ndimage.generate_binary_structure(3, 1)
+        fg_dilated = ndimage.binary_dilation(fg, structure=struct, iterations=dilate_iters)
+    else:
+        fg_dilated = fg
+    bg_mask = ~fg_dilated
+
+    out: dict[str, dict[str, float]] = {}
+    for ch_name, ch_idx in CHANNEL_INDICES.items():
+        bg_vals = combined_zcyx[:, ch_idx, :, :][bg_mask].astype(np.float64, copy=False)
+        if bg_vals.size == 0:
+            out[ch_name] = {"bg_mean": 0.0, "bg_std": 0.0, "bg_n": 0}
+            continue
+        if top_clip_pct > 0:
+            cutoff = float(np.percentile(bg_vals, 100.0 - top_clip_pct))
+            bg_vals = bg_vals[bg_vals <= cutoff]
+        if bg_vals.size == 0:
+            out[ch_name] = {"bg_mean": 0.0, "bg_std": 0.0, "bg_n": 0}
+            continue
+        out[ch_name] = {
+            "bg_mean": float(np.mean(bg_vals)),
+            "bg_std": float(np.std(bg_vals)),
+            "bg_n": int(bg_vals.size),
+        }
+    return out
+
+
+def _log_otsu_per_channel(
+    combined_zcyx: np.ndarray, mask: np.ndarray
+) -> dict[str, float]:
+    """Per-channel log_otsu over positive voxels under label foreground.
+
+    Helper for the otsu_or_bg hybrid. Equivalent to
+    ``_compute_pixel_thresholds_from_volume(method='log_otsu')`` but kept
+    separate so the bg_sigma / otsu_or_bg paths can request both bg-stats and
+    log_otsu values from one shared computation surface.
+    """
+    return _compute_pixel_thresholds_from_volume(combined_zcyx, mask, method="log_otsu")
+
+
+def _bg_sigma_thresholds(
+    bg_stats: dict[str, dict[str, float]], x: float
+) -> dict[str, float]:
+    return {ch: bg_stats[ch]["bg_mean"] + x * bg_stats[ch]["bg_std"] for ch in CHANNEL_NAMES}
+
+
+def _otsu_or_bg_thresholds(
+    bg_stats: dict[str, dict[str, float]], log_otsu_T: dict[str, float], x: float
+) -> dict[str, float]:
+    bg_T = _bg_sigma_thresholds(bg_stats, x)
+    return {ch: max(float(log_otsu_T[ch]), float(bg_T[ch])) for ch in CHANNEL_NAMES}
+
+
+def _method_suffix(method: str) -> str:
+    """Column suffix used in ``pass_<suffix>_shape`` for the chosen method."""
+    if method == "otsu2":
+        return "otsu2"
+    if method == "bg_sigma":
+        return "bg_sigma"
+    if method == "otsu_or_bg":
+        return "otsu_or_bg"
+    return "otsu"
+
+
 def run_from_volume(
     output_dir: Path,
     method_str: str = "log_otsu",
     force: bool = False,
     variant: str = DEFAULT_VARIANT,
     shape_params: ShapeFilterParams | None = None,
+    bg_dilate_iters: int = 2,
+    bg_top_clip_pct: float = 1.0,
 ) -> int:
     """Intensity QC from variant mask + combined TIFF (no cell crops required)."""
     sp = shape_params or DEFAULT_SHAPE_PARAMS
@@ -318,12 +431,36 @@ def run_from_volume(
             rows[i][f"mean_{ch_name}"] = float(means[i])
 
     method, param = _parse_method(method_str)
-    thresholds: dict[str, float] = {}
-    for ch in CHANNEL_NAMES:
-        values = np.array([float(r[f"mean_{ch}"]) for r in rows], dtype=np.float64)
-        thresholds[ch] = _compute_threshold(values, method, param)
 
-    px_thresholds = _compute_pixel_thresholds_from_volume(combined, mask_i, method=method)
+    if method in ("bg_sigma", "otsu_or_bg"):
+        x_val = float(param) if param is not None else 3.0
+        print(
+            f"  bg_stats: dilate_iters={bg_dilate_iters}  top_clip_pct={bg_top_clip_pct}  "
+            f"method={method}  X={x_val}"
+        )
+        bg_stats = _compute_background_stats(
+            combined, mask_i, dilate_iters=bg_dilate_iters, top_clip_pct=bg_top_clip_pct
+        )
+        for ch in CHANNEL_NAMES:
+            print(
+                f"    ch {ch}: bg_mean={bg_stats[ch]['bg_mean']:.4g}  "
+                f"bg_std={bg_stats[ch]['bg_std']:.4g}  bg_n={bg_stats[ch]['bg_n']:,d}"
+            )
+        if method == "otsu_or_bg":
+            log_otsu_T = _log_otsu_per_channel(combined, mask_i)
+            thresholds = _otsu_or_bg_thresholds(bg_stats, log_otsu_T, x_val)
+        else:
+            thresholds = _bg_sigma_thresholds(bg_stats, x_val)
+        # bg-anchored thresholds use the same value for cell-mean and pixel
+        # paths (both are compared against the per-cell mean below); keep both
+        # CSV columns populated so downstream consumers don't need to branch.
+        px_thresholds = dict(thresholds)
+    else:
+        thresholds = {}
+        for ch in CHANNEL_NAMES:
+            values = np.array([float(r[f"mean_{ch}"]) for r in rows], dtype=np.float64)
+            thresholds[ch] = _compute_threshold(values, method, param)
+        px_thresholds = _compute_pixel_thresholds_from_volume(combined, mask_i, method=method)
 
     max_lab = int(mask_i.max())
     label_slices = ndimage.find_objects(mask_i, max_lab)
@@ -331,8 +468,8 @@ def run_from_volume(
     str_rows: list[dict[str, str]] = []
     n_shape_fail = 0
     n_px_fail = 0
-    
-    method_suffix = "otsu2" if method == "otsu2" else "otsu"
+
+    method_suffix = _method_suffix(method)
     
     for row in rows:
         cid = int(row["cell_id"])
@@ -511,6 +648,18 @@ def main() -> int:
     ap.add_argument("--shape-min-vol-erode", type=int, default=DEFAULT_SHAPE_PARAMS.min_vol_erode_test)
     ap.add_argument("--shape-min-vol-skip", type=int, default=DEFAULT_SHAPE_PARAMS.min_vol_skip_all)
     ap.add_argument("--shape-erode-iterations", type=int, default=DEFAULT_SHAPE_PARAMS.erode_iterations)
+    ap.add_argument(
+        "--bg-dilate-iters",
+        type=int,
+        default=2,
+        help="bg_sigma/otsu_or_bg: dilate the cell mask by N voxels before taking complement (default: 2).",
+    )
+    ap.add_argument(
+        "--bg-top-clip-pct",
+        type=float,
+        default=1.0,
+        help="bg_sigma/otsu_or_bg: drop top P%% of background voxels as debris before mean/std (default: 1.0).",
+    )
     args = ap.parse_args()
     _, output_dir = _resolve_dirs(args)
     if args.from_volume:
@@ -529,6 +678,8 @@ def main() -> int:
             force=args.force,
             variant=args.variant,
             shape_params=sp,
+            bg_dilate_iters=max(0, int(args.bg_dilate_iters)),
+            bg_top_clip_pct=max(0.0, float(args.bg_top_clip_pct)),
         )
     return run(output_dir, method_str=args.method, force=args.force, variant=args.variant)
 
