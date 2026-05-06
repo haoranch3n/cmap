@@ -42,13 +42,9 @@ run_variant() {
   return 0
 }
 
+# Per user direction (2026-05-06): focus on union_488_560 only.
 run_variant "union_488_560"
-run_variant "filtered_642"
-
-# Sensitivity: same runs without negative clipping (same default --report-csv
-# overwrites; redirect reports to alternate filenames).
 run_variant "union_488_560" "--no-clip-negatives --report-csv ${SAMPLE_DIR}/bg_threshold_report_union_488_560_noclip.csv"
-run_variant "filtered_642"  "--no-clip-negatives --report-csv ${SAMPLE_DIR}/bg_threshold_report_filtered_642_noclip.csv"
 
 echo
 echo "=========================================="
