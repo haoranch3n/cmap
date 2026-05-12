@@ -50,9 +50,14 @@ DATASET_SPECS_UNION_488_560: tuple[tuple[str, str], ...] = (
     ("4_18_25", "cell_qc_union_488_560"),
     ("4_24_25_CGN_6_10_2", "cell_qc_union_488_560"),
 )
+DATASET_SPECS_BG_SIGMA_488560_SHAPE: tuple[tuple[str, str], ...] = (
+    ("4_18_25", "cell_qc_bg_sigma_488560_shape"),
+    ("4_24_25_CGN_6_10_2", "cell_qc_bg_sigma_488560_shape"),
+)
 DATASET_SPECS_BY_VARIANT: dict[str, tuple[tuple[str, str], ...]] = {
     "filtered_642": DATASET_SPECS_FILTERED_642,
     "union_488_560": DATASET_SPECS_UNION_488_560,
+    "bg_sigma_488560_shape": DATASET_SPECS_BG_SIGMA_488560_SHAPE,
 }
 DEFAULT_DATASET_SPECS: tuple[tuple[str, str], ...] = DATASET_SPECS_FILTERED_642
 
@@ -72,6 +77,9 @@ def master_filenames_for_variant(variant: str) -> tuple[str, str]:
         f"dinov2_embedding_{variant}_all.csv",
         f"dinov2_embeddings_{variant}_all.npy",
     )
+
+
+_ALL_VARIANT_CHOICES: tuple[str, ...] = tuple(DATASET_SPECS_BY_VARIANT.keys())
 
 DEFAULT_N_NEIGHBORS = (5, 15, 30)
 DEFAULT_MIN_DIST = (0.0, 0.1)
@@ -299,11 +307,12 @@ def main() -> int:
     )
     ap.add_argument(
         "--variant",
-        choices=VALID_VARIANTS,
+        choices=_ALL_VARIANT_CHOICES,
         default=DEFAULT_VARIANT,
         help=(
             f"Mask variant; selects DATASET_SPECS, sweep folder, and master "
-            f"CSV/NPY filenames (default: {DEFAULT_VARIANT})."
+            f"CSV/NPY filenames (default: {DEFAULT_VARIANT}). "
+            f"Choices: {_ALL_VARIANT_CHOICES}."
         ),
     )
     args = ap.parse_args()

@@ -100,6 +100,12 @@ def load_pool_from_triplets(
         df.insert(0, "sample", sample_name)
         if dataset is not None:
             df.insert(1, "dataset", dataset)
+        bg_csv = npy_path.parent / "bg_stats.csv"
+        if bg_csv.is_file():
+            bg_df = pd.read_csv(bg_csv)
+            if len(bg_df) == 1:
+                for col in bg_df.columns:
+                    df[col] = bg_df.iloc[0][col]
         arrays.append(emb)
         frames.append(df)
         print(f"  {dataset + '/' if dataset else ''}{sample_name}: {emb.shape}")
