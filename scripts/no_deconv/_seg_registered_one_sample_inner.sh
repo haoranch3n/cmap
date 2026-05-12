@@ -20,8 +20,10 @@ set -euo pipefail
 : "${PROJECT_ROOT:?}"
 
 REG="$(cd "$NO_DECONV_REGISTERED" && pwd)"
-MER="$(cd "$NO_DECONV_MERGE" && pwd)"
 ROOT="$(cd "$PROJECT_ROOT" && pwd)"
+
+mkdir -p "$NO_DECONV_MERGE"
+MER="$(cd "$NO_DECONV_MERGE" && pwd)"
 
 F488="${REG}/488nm_registered.tif"
 F560="${REG}/560nm_registered.tif"
@@ -32,8 +34,6 @@ for f in "$F488" "$F560" "$F642"; do
     exit 1
   fi
 done
-
-mkdir -p "$MER"
 
 # Symlinks at merge root so postprocess can resolve originals (488nm_crop.tif).
 ln -sfn "$F488" "${MER}/488nm_crop.tif"
