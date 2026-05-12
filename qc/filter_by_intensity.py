@@ -13,6 +13,15 @@ Supported ``--method`` values:
 - ``otsu_or_bg:X``     -- hybrid floor: ``T = max(log_otsu_T, bg_mean+X*bg_std)``.
   Falls back to bg_sigma when log_otsu collapses; tightens to log_otsu when
   it actually finds bimodality.
+- ``otsu_or_bg_voxel:X`` -- **same hybrid as** ``otsu_or_bg:X`` (independent
+  ``T`` per channel from voxel log-Otsu + bg stats). **Requires** ``--from-volume``.
+  Writes ``otsu_or_bg_voxel_threshold_{642,488,560}``,
+  ``otsu_or_bg_voxel_pass_{642,488,560}``, and ``pass_otsu_or_bg_voxel_<chans>_shape``
+  (no generic ``threshold_*`` columns). Use ``--cell-qc-dir-name`` to avoid
+  overwriting the default union QC folder.
+- ``--voxel-488-log-otsu-positive-pctile-lo P`` with ``--from-volume`` and
+  ``otsu_or_bg*``: trim channel-488 positive voxels below the ``P``-th
+  percentile of positives before voxel log-Otsu (``0`` = off; try ``1``–``2``).
 - ``percentile:N`` / ``fixed:V`` -- legacy diagnostic options.
 
 With ``--from-volume``, optional 3D shape gates (bbox aspect, fill ratio,
@@ -21,7 +30,7 @@ receive ``pass_shape=0`` and ``pass_<method>_shape`` stays 0 even when the
 intensity gate would pass (so ``apply_qc_pass_to_label_mask.py`` drops them).
 The ``pass_<method>_shape`` column is named after the chosen method
 (``pass_otsu_shape`` / ``pass_otsu2_shape`` / ``pass_bg_sigma_shape`` /
-``pass_otsu_or_bg_shape``).
+``pass_otsu_or_bg_shape`` / ``pass_otsu_or_bg_voxel_488560_shape``, etc.).
 """
 from __future__ import annotations
 
@@ -147,8 +156,11 @@ def _resolve_dirs(args) -> tuple[Path, Path]:
             else PROJECT_ROOT / "output" / args.data_rel
         )
     elif args.output_dir:
-        data_dir = args.output_dir.resolve()
-        output_dir = args.output_dir.resolve()
+        # Use absolute() not resolve() — resolve() follows all symlinks and can
+        # convert /research/dept/... to an inaccessible /research_jude/... canonical
+        # path on compute nodes where the mount alias differs.
+        data_dir = args.output_dir.absolute()
+        output_dir = args.output_dir.absolute()
     else:
         raise SystemExit("Provide either --data-rel or --output-dir")
     return data_dir, output_dir
@@ -171,6 +183,11 @@ def _parse_method(method_str: str) -> tuple[str, float | None]:
         if val <= 0:
             raise ValueError(f"otsu_or_bg X must be > 0, got {val}")
         return "otsu_or_bg", val
+    if method_str.startswith("otsu_or_bg_voxel:"):
+        val = float(method_str.split(":", 1)[1])
+        if val <= 0:
+            raise ValueError(f"otsu_or_bg_voxel X must be > 0, got {val}")
+        return "otsu_or_bg_voxel", val
     if method_str.startswith("percentile:"):
         val = float(method_str.split(":", 1)[1])
         if not 0 < val < 100:
@@ -180,7 +197,8 @@ def _parse_method(method_str: str) -> tuple[str, float | None]:
         return "fixed", float(method_str.split(":", 1)[1])
     raise ValueError(
         "Unknown method. Use 'log_otsu', 'otsu', 'otsu2', "
-        "'bg_sigma:X', 'otsu_or_bg:X', 'percentile:N', or 'fixed:V'."
+        "'bg_sigma:X', 'otsu_or_bg:X', 'otsu_or_bg_voxel:X', "
+        "'percentile:N', or 'fixed:V'."
     )
 
 
@@ -251,19 +269,40 @@ def _compute_pixel_thresholds(box_dir: Path) -> dict[str, float]:
 
 
 def _compute_pixel_thresholds_from_volume(
-    combined_zcyx: np.ndarray, mask: np.ndarray, method: str = "log_otsu"
+    combined_zcyx: np.ndarray,
+    mask: np.ndarray,
+    method: str = "log_otsu",
+    voxel_488_positive_pctile_lo: float = 0.0,
 ) -> dict[str, float]:
-    """Apply thresholding method on positive voxels under label foreground."""
+    """Apply thresholding method on positive voxels under label foreground.
+
+    ``voxel_488_positive_pctile_lo`` (Method A): for channel 488 only, after
+    ``pos = vals[vals > 0]``, optionally drop voxels below the
+    ``p``-th percentile of ``pos`` (``p`` in ``[0, 50)``) before ``log``+Otsu,
+    to reduce denormal / near-zero dominance. ``0`` disables. Other channels
+    unchanged.
+    """
     from skimage.filters import threshold_otsu
 
     thresholds: dict[str, float] = {}
     fg = mask > 0
+    p_lo = float(voxel_488_positive_pctile_lo)
     for ch_name, ch_idx in CHANNEL_INDICES.items():
         vals = combined_zcyx[:, ch_idx, :, :][fg].astype(np.float64).ravel()
         pos = vals[vals > 0]
         if len(pos) < 2:
             thresholds[ch_name] = 0.0
             continue
+        if (
+            method == "log_otsu"
+            and ch_name == "488"
+            and p_lo > 0.0
+            and p_lo < 50.0
+        ):
+            cut = float(np.percentile(pos, p_lo))
+            pos_trim = pos[pos >= cut]
+            if pos_trim.size >= 2:
+                pos = pos_trim
         try:
             if method == "log_otsu":
                 thresholds[ch_name] = float(np.exp(float(threshold_otsu(np.log(pos)))))
@@ -324,7 +363,9 @@ def _compute_background_stats(
 
 
 def _log_otsu_per_channel(
-    combined_zcyx: np.ndarray, mask: np.ndarray
+    combined_zcyx: np.ndarray,
+    mask: np.ndarray,
+    voxel_488_positive_pctile_lo: float = 0.0,
 ) -> dict[str, float]:
     """Per-channel log_otsu over positive voxels under label foreground.
 
@@ -333,7 +374,31 @@ def _log_otsu_per_channel(
     separate so the bg_sigma / otsu_or_bg paths can request both bg-stats and
     log_otsu values from one shared computation surface.
     """
-    return _compute_pixel_thresholds_from_volume(combined_zcyx, mask, method="log_otsu")
+    return _compute_pixel_thresholds_from_volume(
+        combined_zcyx,
+        mask,
+        method="log_otsu",
+        voxel_488_positive_pctile_lo=voxel_488_positive_pctile_lo,
+    )
+
+
+def _save_bg_stats(bg_stats: dict[str, dict[str, float]], qc_dir: Path) -> None:
+    """Write bg_mean/bg_std/bg_n per channel to ``qc_dir/bg_stats.csv`` (one row)."""
+    qc_dir.mkdir(parents=True, exist_ok=True)
+    row: dict[str, str] = {}
+    for ch in CHANNEL_NAMES:
+        row[f"bg_mean_{ch}"] = str(round(bg_stats[ch]["bg_mean"], 6))
+        row[f"bg_std_{ch}"] = str(round(bg_stats[ch]["bg_std"], 6))
+        row[f"bg_n_{ch}"] = str(int(bg_stats[ch]["bg_n"]))
+    fieldnames = list(row.keys())
+    out_csv = qc_dir / "bg_stats.csv"
+    tmp = str(out_csv) + ".tmp"
+    with open(tmp, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerow(row)
+    os.replace(tmp, str(out_csv))
+    print(f"  Wrote bg_stats: {out_csv}")
 
 
 def _bg_sigma_thresholds(
@@ -349,15 +414,28 @@ def _otsu_or_bg_thresholds(
     return {ch: max(float(log_otsu_T[ch]), float(bg_T[ch])) for ch in CHANNEL_NAMES}
 
 
-def _method_suffix(method: str) -> str:
-    """Column suffix used in ``pass_<suffix>_shape`` for the chosen method."""
+def _method_suffix(method: str, filter_channels: list[str] | None = None) -> str:
+    """Column suffix used in ``pass_<suffix>_shape`` for the chosen method.
+
+    When ``filter_channels`` is a strict subset of all channels the channel
+    names are appended without separators, e.g. ``bg_sigma_488560``.
+    """
     if method == "otsu2":
-        return "otsu2"
-    if method == "bg_sigma":
-        return "bg_sigma"
-    if method == "otsu_or_bg":
-        return "otsu_or_bg"
-    return "otsu"
+        base = "otsu2"
+    elif method == "bg_sigma":
+        base = "bg_sigma"
+    elif method == "otsu_or_bg":
+        base = "otsu_or_bg"
+    elif method == "otsu_or_bg_voxel":
+        base = "otsu_or_bg_voxel"
+    else:
+        base = "otsu"
+
+    if filter_channels is not None and set(filter_channels) != set(CHANNEL_NAMES):
+        # Sort by the canonical channel order so the suffix is deterministic.
+        ordered = [ch for ch in CHANNEL_NAMES if ch in filter_channels]
+        base = base + "_" + "".join(ordered)
+    return base
 
 
 def run_from_volume(
@@ -368,8 +446,16 @@ def run_from_volume(
     shape_params: ShapeFilterParams | None = None,
     bg_dilate_iters: int = 2,
     bg_top_clip_pct: float = 1.0,
+    filter_channels: list[str] | None = None,
+    cell_qc_dir_name: str | None = None,
+    voxel_488_positive_pctile_lo: float = 0.0,
 ) -> int:
-    """Intensity QC from variant mask + combined TIFF (no cell crops required)."""
+    """Intensity QC from variant mask + combined TIFF (no cell crops required).
+
+    ``filter_channels`` restricts which channels must pass the intensity gate.
+    All channels are still measured; only the listed ones gate ``pass_intensity``
+    and ``pass_<method>_shape``. Defaults to all channels when ``None``.
+    """
     sp = shape_params or DEFAULT_SHAPE_PARAMS
     v = variant_files(variant)
     print(
@@ -384,7 +470,15 @@ def run_from_volume(
         )
     else:
         print("  shape_filter: off")
-    qc_dir = output_dir / v["cell_qc"]
+    qc_rel = cell_qc_dir_name if cell_qc_dir_name else v["cell_qc"]
+    qc_dir = output_dir / qc_rel
+    if cell_qc_dir_name:
+        print(f"  cell_qc dir (override): {qc_rel}")
+    if voxel_488_positive_pctile_lo > 0:
+        print(
+            f"  voxel_488_positive_pctile_lo={voxel_488_positive_pctile_lo} "
+            "(trim 488 positives before voxel log-Otsu)"
+        )
     output_csv = qc_dir / "qc_features_filtered.csv"
     if output_csv.exists() and not force:
         print(f"SKIP (exists): {output_csv}  (use --force to overwrite)")
@@ -432,7 +526,7 @@ def run_from_volume(
 
     method, param = _parse_method(method_str)
 
-    if method in ("bg_sigma", "otsu_or_bg"):
+    if method in ("bg_sigma", "otsu_or_bg", "otsu_or_bg_voxel"):
         x_val = float(param) if param is not None else 3.0
         print(
             f"  bg_stats: dilate_iters={bg_dilate_iters}  top_clip_pct={bg_top_clip_pct}  "
@@ -446,8 +540,11 @@ def run_from_volume(
                 f"    ch {ch}: bg_mean={bg_stats[ch]['bg_mean']:.4g}  "
                 f"bg_std={bg_stats[ch]['bg_std']:.4g}  bg_n={bg_stats[ch]['bg_n']:,d}"
             )
-        if method == "otsu_or_bg":
-            log_otsu_T = _log_otsu_per_channel(combined, mask_i)
+        _save_bg_stats(bg_stats, qc_dir)
+        if method in ("otsu_or_bg", "otsu_or_bg_voxel"):
+            log_otsu_T = _log_otsu_per_channel(
+                combined, mask_i, voxel_488_positive_pctile_lo=voxel_488_positive_pctile_lo
+            )
             thresholds = _otsu_or_bg_thresholds(bg_stats, log_otsu_T, x_val)
         else:
             thresholds = _bg_sigma_thresholds(bg_stats, x_val)
@@ -469,8 +566,12 @@ def run_from_volume(
     n_shape_fail = 0
     n_px_fail = 0
 
-    method_suffix = _method_suffix(method)
-    
+    # Channels that must pass to gate the combined pass flags.
+    filter_set = set(filter_channels) if filter_channels else set(CHANNEL_NAMES)
+    if filter_channels and set(filter_channels) != set(CHANNEL_NAMES):
+        print(f"  filter_channels: {sorted(filter_channels)}  (642 not required to pass)")
+    method_suffix = _method_suffix(method, filter_channels)
+
     for row in rows:
         cid = int(row["cell_id"])
         out: dict[str, str] = {"cell_id": str(cid)}
@@ -496,15 +597,20 @@ def run_from_volume(
             val = float(row[f"mean_{ch}"])
             passed = int(val >= thresholds[ch])
             out[f"mean_{ch}"] = str(round(val, 6))
-            out[f"threshold_{ch}"] = str(round(thresholds[ch], 4))
-            out[f"pass_{ch}"] = str(passed)
-            if not passed:
+            if method == "otsu_or_bg_voxel":
+                out[f"otsu_or_bg_voxel_threshold_{ch}"] = str(round(thresholds[ch], 4))
+                out[f"otsu_or_bg_voxel_pass_{ch}"] = str(passed)
+            else:
+                out[f"threshold_{ch}"] = str(round(thresholds[ch], 4))
+                out[f"pass_{ch}"] = str(passed)
+            if ch in filter_set and not passed:
                 all_pass = False
 
             px_passed = int(val >= px_thresholds[ch])
-            out[f"px_threshold_{ch}"] = str(round(px_thresholds[ch], 4))
-            out[f"px_pass_{ch}"] = str(px_passed)
-            if not px_passed:
+            if method != "otsu_or_bg_voxel":
+                out[f"px_threshold_{ch}"] = str(round(px_thresholds[ch], 4))
+                out[f"px_pass_{ch}"] = str(px_passed)
+            if ch in filter_set and not px_passed:
                 all_px_pass = False
         out["pass_intensity"] = str(int(all_pass))
         px_only = int(all_px_pass)
@@ -521,12 +627,23 @@ def run_from_volume(
         "shape_erode2_n_cc",
         "pass_shape",
     ]
-    tail_cols: list[str] = []
-    for ch in CHANNEL_NAMES:
-        tail_cols.extend(
-            [f"threshold_{ch}", f"pass_{ch}", f"px_threshold_{ch}", f"px_pass_{ch}"]
-        )
-    tail_cols.extend(["pass_intensity", f"pass_{method_suffix}_shape"])
+    if method == "otsu_or_bg_voxel":
+        tail_cols: list[str] = []
+        for ch in CHANNEL_NAMES:
+            tail_cols.extend(
+                [
+                    f"otsu_or_bg_voxel_threshold_{ch}",
+                    f"otsu_or_bg_voxel_pass_{ch}",
+                ]
+            )
+        tail_cols.extend(["pass_intensity", f"pass_{method_suffix}_shape"])
+    else:
+        tail_cols = []
+        for ch in CHANNEL_NAMES:
+            tail_cols.extend(
+                [f"threshold_{ch}", f"pass_{ch}", f"px_threshold_{ch}", f"px_pass_{ch}"]
+            )
+        tail_cols.extend(["pass_intensity", f"pass_{method_suffix}_shape"])
     base_cols = ["cell_id", "mean_642", "mean_488", "mean_560"]
     fieldnames = base_cols + shape_cols + tail_cols
     print(
@@ -660,8 +777,55 @@ def main() -> int:
         default=1.0,
         help="bg_sigma/otsu_or_bg: drop top P%% of background voxels as debris before mean/std (default: 1.0).",
     )
+    ap.add_argument(
+        "--filter-channels",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated channel names that must pass the intensity gate "
+            "(default: all channels). E.g. '488,560' to require only those two "
+            "channels and treat 642/DAPI as non-gating. All channels are still "
+            "measured; only the listed ones affect pass_intensity and "
+            "pass_<method>_shape."
+        ),
+    )
+    ap.add_argument(
+        "--cell-qc-dir-name",
+        type=str,
+        default=None,
+        help=(
+            "With --from-volume: write QC CSV and bg_stats under "
+            "OUTPUT_DIR/<this> instead of the variant's default cell_qc folder "
+            "(relative name, e.g. cell_qc_union_488_560_otsu_or_bg_voxel)."
+        ),
+    )
+    ap.add_argument(
+        "--voxel-488-log-otsu-positive-pctile-lo",
+        type=float,
+        default=0.0,
+        help=(
+            "With --from-volume and otsu_or_bg / otsu_or_bg_voxel: for 488 only, "
+            "drop positive voxels below this percentile of the positive-voxel pool "
+            "before voxel log-Otsu (0 disables; typical sweep 0.5–3)."
+        ),
+    )
     args = ap.parse_args()
     _, output_dir = _resolve_dirs(args)
+    if float(args.voxel_488_log_otsu_positive_pctile_lo) < 0 or float(
+        args.voxel_488_log_otsu_positive_pctile_lo
+    ) >= 50:
+        raise SystemExit("--voxel-488-log-otsu-positive-pctile-lo must be in [0, 50)")
+    if (
+        float(args.voxel_488_log_otsu_positive_pctile_lo) > 0
+        and args.from_volume
+        and not str(args.method).startswith(("otsu_or_bg", "otsu_or_bg_voxel"))
+    ):
+        raise SystemExit(
+            "--voxel-488-log-otsu-positive-pctile-lo only applies with "
+            "--method otsu_or_bg:* or otsu_or_bg_voxel:*"
+        )
+    if not args.from_volume and str(args.method).startswith("otsu_or_bg_voxel"):
+        raise SystemExit("otsu_or_bg_voxel:* requires --from-volume")
     if args.from_volume:
         sp = ShapeFilterParams(
             enabled=args.shape_filter == "on",
@@ -672,6 +836,15 @@ def main() -> int:
             min_vol_skip_all=args.shape_min_vol_skip,
             erode_iterations=max(0, int(args.shape_erode_iterations)),
         )
+        fc: list[str] | None = None
+        if args.filter_channels:
+            fc = [c.strip() for c in args.filter_channels.split(",") if c.strip()]
+            invalid = [c for c in fc if c not in CHANNEL_NAMES]
+            if invalid:
+                raise SystemExit(
+                    f"--filter-channels: unknown channel(s) {invalid}. "
+                    f"Valid: {list(CHANNEL_NAMES)}"
+                )
         return run_from_volume(
             output_dir,
             method_str=args.method,
@@ -680,6 +853,9 @@ def main() -> int:
             shape_params=sp,
             bg_dilate_iters=max(0, int(args.bg_dilate_iters)),
             bg_top_clip_pct=max(0.0, float(args.bg_top_clip_pct)),
+            filter_channels=fc,
+            cell_qc_dir_name=args.cell_qc_dir_name,
+            voxel_488_positive_pctile_lo=float(args.voxel_488_log_otsu_positive_pctile_lo),
         )
     return run(output_dir, method_str=args.method, force=args.force, variant=args.variant)
 

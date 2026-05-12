@@ -63,7 +63,9 @@ def _pass_qc_column(rows: list[dict[str, str]], explicit: str | None = None) -> 
     # Auto-detect order: prefer the most specific method-named columns first,
     # then fall back to the legacy generic names.
     for candidate in (
+        "pass_bg_sigma_488560_shape",
         "pass_bg_sigma_shape",
+        "pass_otsu_or_bg_voxel_488560_shape",
         "pass_otsu_or_bg_shape",
         "pass_otsu2_shape",
         "pass_otsu_shape",
@@ -74,8 +76,8 @@ def _pass_qc_column(rows: list[dict[str, str]], explicit: str | None = None) -> 
             return candidate
     raise ValueError(
         "CSV missing pass column: expected one of "
-        "pass_bg_sigma_shape / pass_otsu_or_bg_shape / pass_otsu2_shape / "
-        "pass_otsu_shape / pass_qc / pass_pixel_intensity"
+        "pass_bg_sigma_488560_shape / pass_bg_sigma_shape / pass_otsu_or_bg_voxel_488560_shape / "
+        "pass_otsu_or_bg_shape / pass_otsu2_shape / pass_otsu_shape / pass_qc / pass_pixel_intensity"
     )
 
 
@@ -202,7 +204,7 @@ def main() -> int:
         default=None,
         help=(
             "Explicit name of the pass-flag column in qc_features_filtered.csv "
-            "(e.g. pass_bg_sigma_shape, pass_otsu_or_bg_shape, pass_otsu2_shape, "
+            "(e.g. pass_bg_sigma_shape, pass_otsu_or_bg_voxel_488560_shape, pass_otsu_or_bg_shape, pass_otsu2_shape, "
             "pass_otsu_shape). Default: auto-detect, preferring the most-specific "
             "method-named column."
         ),
