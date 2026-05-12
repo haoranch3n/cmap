@@ -51,9 +51,11 @@ def test_variant_files_keys_match_for_all_variants():
     assert DEFAULT_VARIANT in VALID_VARIANTS
     for v, mapping in VARIANT_FILES.items():
         missing = REQUIRED_KEYS - set(mapping.keys())
-        extra = set(mapping.keys()) - REQUIRED_KEYS
         assert not missing, f"variant {v!r} missing keys: {sorted(missing)}"
-        assert not extra, f"variant {v!r} has extra keys: {sorted(extra)}"
+        # Variants may carry additional per-variant keys (e.g. union_488_560
+        # adds cell_box_bg_sigma_shape and cell_box_bg_sigma_488560_shape used
+        # by features/crop_cells.py --output-subdir-key). Only the required
+        # keys above are enforced as a contract for downstream consumers.
 
 
 def test_variant_files_filtered_642_values_are_legacy_strings():
@@ -71,14 +73,14 @@ def test_variant_files_filtered_642_values_are_legacy_strings():
 
 def test_variant_files_union_488_560_values():
     v = variant_files("union_488_560")
-    assert v["mask"] == "union_488_560.tif"
+    assert v["mask"] == "union_488_560_strict_overlap.tif"
     assert v["combined"] == "union_488_560_combined.tif"
     assert v["cell_box"] == "cell_boxing_union_488_560"
     assert v["cell_box_full_z"] == "cell_boxing_full_z_union_488_560"
     assert v["cell_box_filtered"] == "cell_box_otsu_shape_filtered"
     assert v["cell_box_full_z_filtered"] == "cell_box_full_z_otsu_shape_filtered"
     assert v["cell_qc"] == "cell_qc_union_488_560"
-    assert v["pass_otsu_shape"] == "union_488_560_otsu_shape.tif"
+    assert v["pass_otsu_shape"] == "union_488_560_strict_overlap_otsu_shape.tif"
     assert v["dinov2_volume_bounds"] == "dinov2_volume_norm_bounds_union_488_560.csv"
 
 
@@ -97,9 +99,9 @@ def test_variant_files_unknown_variant_raises():
 
 
 def _build_union_fixture(output_dir: Path) -> None:
-    """Write a tiny union_488_560.tif + union_488_560_combined.tif under
-    ``output_dir`` so ``features/crop_cells.py --variant union_488_560`` can
-    process it without any segmentation step.
+    """Write a tiny union_488_560_strict_overlap.tif + union_488_560_combined.tif
+    under ``output_dir`` so ``features/crop_cells.py --variant union_488_560``
+    can process it without any segmentation step.
     """
     z, y, x = 4, 24, 24
     mask = np.zeros((z, y, x), dtype=np.uint16)
@@ -120,7 +122,7 @@ def _build_union_fixture(output_dir: Path) -> None:
         metadata={"axes": "ZCYX", "mode": "grayscale"},
     )
     tifffile.imwrite(
-        str(output_dir / "union_488_560.tif"),
+        str(output_dir / "union_488_560_strict_overlap.tif"),
         mask,
         compression="zlib",
     )

@@ -71,8 +71,8 @@ run_one() {
 # filtered_642 variant has its own well-behaved log_otsu thresholds and is
 # not the failure mode the new bg_sigma method is meant to fix.
 run_one "union_488_560" \
-        "union_488_560.tif" \
-        "union_488_560_pass_bg_sigma_shape.tif" \
+        "union_488_560_strict_overlap.tif" \
+        "union_488_560_strict_overlap_pass_bg_sigma_shape.tif" \
         "cell_qc_union_488_560/qc_features_filtered.csv"
 
 echo
