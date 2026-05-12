@@ -19,10 +19,14 @@
 #   CMAP_NO_DECONV_FORCE        — set to 1 to resubmit even if 3D indexed masks exist
 #   CMAP_SUBMIT_LIMIT           — max jobs to submit (debug)
 #   CMAP_SAMPLE_FILTER          — substring filter on sample dir name
+#   CMAP_NO_DECONV_QUEUE        — LSF GPU queue (default: gpu). Example:
+#                                 CMAP_NO_DECONV_QUEUE=rhel88_gpu
 #
-# Queue: rhel88_gpu (Cellpose). No email flags.
+# Queue: gpu (Cellpose). No email flags.
 
 set -euo pipefail
+
+QUEUE="${CMAP_NO_DECONV_QUEUE:-gpu}"
 
 PROJECT_ROOT="${CMAP_REPO_ROOT:-/research_jude/rgs01_jude/dept/DNB/core_operations/ImageAnalysis/Core/Haoran/cmap}"
 PROJECT_ROOT="$(cd "$PROJECT_ROOT" && pwd)"
@@ -51,6 +55,15 @@ mkdir -p "$LOG_BASE"
 n_sub=0
 n_skip_done=0
 n_skip_inputs=0
+n_skip_inflight=0
+
+# True if any job with this exact -J name is RUN or PEND (any queue). Uses
+# explicit -o stat so we do not rely on default bjobs column positions.
+ndseg_job_inflight() {
+  local jname="$1"
+  bjobs -J "$jname" -noheader -o stat 2>/dev/null \
+    | awk '{ if ($1 == "RUN" || $1 == "PEND") found=1 } END { exit(found ? 0 : 1) }'
+}
 
 for dataset in $DATASETS; do
   IN_DS="${INPUT_BASE}/${dataset}"
@@ -101,10 +114,16 @@ for dataset in $DATASETS; do
     job="ndseg_${dataset}_${sam}"
     job="${job//[^A-Za-z0-9_]/_}"
 
-    echo "  Submit: $dataset/$sam -> $MERGE"
+    if ndseg_job_inflight "$job"; then
+      echo "  SKIP $sam: job already RUN or PEND ($job)"
+      n_skip_inflight=$((n_skip_inflight + 1))
+      continue
+    fi
+
+    echo "  Submit: $dataset/$sam -> $MERGE  (queue=$QUEUE)"
     bsub \
       -J "$job" \
-      -q rhel88_gpu \
+      -q "$QUEUE" \
       -gpu "num=1:j_exclusive=yes" \
       -n 1 \
       -R "rusage[mem=65536] span[hosts=1]" \
@@ -124,9 +143,10 @@ for dataset in $DATASETS; do
 done
 
 echo ""
-echo "Submitted: $n_sub GPU job(s) (rhel88_gpu)."
+echo "Submitted: $n_sub GPU job(s) (queue=$QUEUE)."
 echo "  Skipped (all three *_3D_indexed.tif already present): $n_skip_done"
 echo "  Skipped (missing inputs):                        $n_skip_inputs"
+echo "  Skipped (job already RUN or PEND):               $n_skip_inflight"
 echo "Output base: $OUTPUT_BASE"
 echo "Logs:        $LOG_BASE/<dataset>/"
 echo "Monitor:     bjobs -J 'ndseg_*'"
