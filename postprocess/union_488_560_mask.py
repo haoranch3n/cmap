@@ -1,48 +1,72 @@
 #!/usr/bin/env python3
 """
-Merge the 488nm and 560nm Cellpose indexed masks into a single indexed cell
-mask using IoMin label stitching.
+Strict-overlap merge of 488nm + 560nm Cellpose indexed masks.
 
-Algorithm
----------
+Algorithm (strict-by-construction)
+---------------------------------
 
 For every pair of labels ``(a, b)`` where ``a`` is a 488 cell and ``b`` is a
 560 cell with at least one shared voxel, compute::
 
     IoMin(a, b) = |a INTERSECT b| / min(|a|, |b|)
 
-Build a bipartite graph with edges ``(a, b)`` whenever ``IoMin >= tau``. The
-connected components of that graph define the merged cells:
+A bipartite edge ``(a, b)`` is added whenever ``IoMin >= tau``. The connected
+components of that graph are then filtered through **three construction gates**
+before being emitted as cells:
 
-- Component ``{a}`` only: 488-only cell with no 560 match.
-- Component ``{b}`` only: 560-only cell with no 488 match.
-- Component ``{a, b}``: clean 1-1 pair across channels.
-- Component ``{a, b1, b2}`` or larger: same biological cell over-segmented in
-  one channel; both channels' voxels go to one fused ID.
+1. **Gate-1 (mixed-channel):** a component must contain at least one 488
+   label AND at least one 560 label. Single-channel components
+   (``488_only`` / ``560_only``) are dropped entirely.
+2. **Gate-2 (pairwise IoMin closure):** for every internal cross-pair
+   ``(a, b)`` inside a component with ``|a INTERSECT b| > 0``,
+   ``IoMin(a, b) >= tau`` must hold. If any internal pair is weak (e.g. a
+   transitive UF over-merge introduced a direct overlap with
+   ``IoMin < tau``), the entire component is dropped. There is no partial
+   salvage.
+3. **Gate-3 (strict 1-1, default):** a component must contain exactly ONE
+   488 label and exactly ONE 560 label. Over-segmentation cases (one 488
+   ID paired with multiple 560 IDs, or vice versa, or true n-to-m fusion)
+   drop the entire component. Pass ``--allow-multimerge`` to disable this
+   gate and keep the n-to-m fusion behavior (gate-1 + gate-2 only).
 
-Each component is assigned a contiguous ID ``1..K`` (sorted by total voxel
-count, descending). Cellpose IDs are mapped through per-channel LUTs so the
-output is a true indexed label volume that preserves cell identity. A 488 cell
-and a 560 cell that do **not** co-locate are never fused, no matter how close
-they sit in space.
+Surviving components are assigned a contiguous ID ``1..K_strict`` (sorted by
+total voxel count, descending). Every emitted cell therefore satisfies the
+strict-overlap invariant: both channels co-segment the cell, every direct
+internal cross-overlap is IoMin-strong, and (by default) each cell is a
+clean 1-1 pair of one 488 label and one 560 label.
 
-Tie-breaker on overlap voxels where 488 and 560 disagree on the component
-(possible when the pair's IoMin is below ``tau``): 488 wins. The disagreeing
+Closure mode (``--closure``):
+
+- ``component`` (default): gate-2 only checks pairs inside the component.
+- ``global``: opt-in pre-pass that drops any label with ANY cross-overlap
+  ``0 < IoMin < tau`` to any opposite-channel label, then rebuilds the pair
+  census on the cleaned masks. Stricter; expected to dissolve more cells.
+
+Tie-breaker on voxels where 488 and 560 disagree on the component (possible
+when the pair's IoMin is below ``tau``): 488 wins by default. The disagreeing
 voxel count is reported as ``conflict_voxels``.
 
 **Writes** (by default):
 
-- ``<output>/union_488_560.tif`` — indexed 3D label volume (``uint16`` if
-  ``K <= 65535`` else ``uint32``).
-- ``<output>/union_488_560_combined.tif`` — 4-channel OME BigTIFF (Z, C, Y, X):
-  642 / 488 / 560 originals + union mask. Use ``--skip-combined`` to skip.
+- ``<output>/union_488_560_strict_overlap.tif`` — indexed 3D label volume
+  (``uint16`` if ``K_strict <= 65535`` else ``uint32``).
+- ``<output>/union_488_560_strict_overlap_manifest.json`` — params snapshot
+  (tau, min_label_voxels, closure, gate counts, K_strict).
+- ``<output>/union_488_560_strict_overlap_label_map.csv`` — per-cell
+  contributor table (cell_id, n_488, n_560, ids_488, ids_560, total_vox).
+- ``<output>/union_488_560_strict_overlap_combined.tif`` — 4-channel OME
+  BigTIFF (Z, C, Y, X): 642 / 488 / 560 originals + strict union mask. Use
+  ``--skip-combined`` to skip.
 
 CLI
 ---
 
-- ``--tau FLOAT`` (default ``0.2``): IoMin threshold for fusion.
+- ``--tau FLOAT`` (default ``0.2``): IoMin threshold for fusion AND gate-2.
 - ``--min-label-voxels INT`` (default ``0``): drop labels smaller than this in
-  either channel before stitching (guards against tiny spurious fragments).
+  either channel before stitching.
+- ``--closure {component,global}`` (default ``component``).
+- ``--allow-multimerge`` (flag, default off): disable gate-3 and keep the
+  n-to-m fusion behavior.
 
 Notes
 -----
@@ -53,10 +77,14 @@ Notes
 - Z-mismatch handling matches ``postprocess/filter_642_mask.py``: if Z differs,
   truncate both volumes to the smallest Z; XY mismatch raises.
 - This script does not touch ``filtered_642*`` artifacts.
+- The legacy non-strict artifact ``union_488_560.tif`` is no longer written.
 """
 from __future__ import annotations
 
 import argparse
+import csv
+import json
+import math
 import os
 import sys
 from collections import defaultdict
@@ -391,12 +419,64 @@ def _smooth_per_label(
     return new_out, diag
 
 
+def _compute_label_map(
+    out: np.ndarray,
+    lut_488: np.ndarray,
+    lut_560: np.ndarray,
+) -> dict[int, dict]:
+    """UF-based label-map: invert the per-channel LUTs.
+
+    Each surviving Cellpose label maps to exactly one final cell ID via the
+    LUT, so each cell's ``ids_488`` / ``ids_560`` is the unambiguous UF
+    membership (no voxel-level spillover from conflict resolution).
+    ``total_vox`` is the voxel count of the final cell in ``out``.
+
+    Note: under ``--split-on-disagree != "off"`` the LUTs do not see the
+    new sub-cell IDs; those rows will be missing from the label-map. That
+    is acceptable for the default (split off) configuration; a separate
+    fallback would be needed before enabling split-on-disagree by default.
+    """
+    label_map: dict[int, dict] = {}
+    used = np.unique(out)
+    used = used[used > 0]
+    if used.size == 0:
+        return label_map
+
+    total_counts = np.bincount(out.astype(np.int64, copy=False).ravel())
+
+    cells_488: dict[int, list[int]] = defaultdict(list)
+    cells_560: dict[int, list[int]] = defaultdict(list)
+    for label_id, cell_id in enumerate(lut_488.tolist()):
+        if label_id == 0 or cell_id == 0:
+            continue
+        cells_488[int(cell_id)].append(int(label_id))
+    for label_id, cell_id in enumerate(lut_560.tolist()):
+        if label_id == 0 or cell_id == 0:
+            continue
+        cells_560[int(cell_id)].append(int(label_id))
+
+    for cid in used.tolist():
+        cid_int = int(cid)
+        ids_488 = sorted(cells_488.get(cid_int, []))
+        ids_560 = sorted(cells_560.get(cid_int, []))
+        label_map[cid_int] = {
+            "n_488": len(ids_488),
+            "n_560": len(ids_560),
+            "ids_488": ids_488,
+            "ids_560": ids_560,
+            "total_vox": int(total_counts[cid_int]),
+        }
+    return label_map
+
+
 def union_488_560_labels(
     m488: np.ndarray,
     m560: np.ndarray,
     *,
     tau: float = 0.2,
     min_label_voxels: int = 0,
+    closure: str = "component",
+    allow_multimerge: bool = False,
     split_on_disagree: str = "off",
     tie_prefer: str = "488",
     drop_disconnected: bool = False,
@@ -405,17 +485,53 @@ def union_488_560_labels(
     conflict_rule: str = "488_wins",
     conflict_merge_threshold: float = 0.05,
 ) -> tuple[np.ndarray, dict]:
-    """IoMin label-stitching merge of two indexed Cellpose masks.
+    """Strict-overlap label-stitching merge of two indexed Cellpose masks.
+
+    The output mask is strict-by-construction: every emitted ``cell_id``
+    satisfies three invariants
+
+      1. **Mixed-channel** -- its connected component contains at least one
+         488 label and at least one 560 label. Single-channel components
+         (``488_only`` / ``560_only``) are dropped.
+      2. **Pairwise IoMin closure** -- for every cross-pair ``(a_488, b_560)``
+         of labels inside the component with ``|a INTERSECT b| > 0`` in the
+         raw masks, ``IoMin(a, b) >= tau``. Components that fail this check
+         are dropped entirely (no partial salvage).
+      3. **Strict 1-1** (default) -- the component contains exactly ONE 488
+         label and exactly ONE 560 label. Any over-segmentation case (one
+         488 ID paired with multiple 560 IDs, or vice versa, or true n-to-m
+         fusion) drops the entire component. Pass ``allow_multimerge=True``
+         to relax this gate and keep the prior n-to-m fusion behavior.
+
+    Gates run between UF and the final LUT build, BEFORE the optional
+    split/drop_disconnected/smooth passes, so post-processing only operates
+    on survivors.
 
     Parameters
     ----------
     m488, m560 : np.ndarray
         ZYX integer label volumes; same shape; 0 = background.
     tau : float
-        IoMin threshold for fusing a 488 label with a 560 label.
+        IoMin threshold for fusing a 488 label with a 560 label and for the
+        gate-2 pairwise closure check.
     min_label_voxels : int
         Drop labels smaller than this from either channel before stitching;
         their voxels become 0 in the output.
+    closure : {'component', 'global'}
+        Strict-overlap closure mode. ``'component'`` (default) only checks
+        pairwise IoMin inside each connected component. ``'global'`` is an
+        opt-in stricter rule: drop any label that has ANY cross-overlap with
+        a label in the other channel where ``0 < IoMin < tau`` -- i.e. a
+        single weak external graze invalidates the label entirely. Recompute
+        the pair census on the cleaned masks before UF.
+    allow_multimerge : bool
+        If ``False`` (default), enforce strict 1-1: every surviving cell
+        has exactly one 488 contributor and exactly one 560 contributor.
+        Components with n-to-m fusion are dropped entirely. If ``True``,
+        allow over-segmentation cases (one 488 paired with several 560 IDs,
+        or vice versa, or n-to-m components where every internal cross-pair
+        is IoMin-strong) to fuse into a single cell -- the gate-2 behavior
+        without gate-3.
     split_on_disagree : {'off', 'clean', 'all'}
         Optional Mode-3 fix for components where 488 and 560 disagree on the
         number of cells. ``'off'`` keeps the current fused behavior. ``'clean'``
@@ -453,6 +569,10 @@ def union_488_560_labels(
     """
     if m488.shape != m560.shape:
         raise ValueError(f"shape mismatch: 488 {m488.shape} vs 560 {m560.shape}")
+    if closure not in ("component", "global"):
+        raise ValueError(
+            f"closure must be 'component' or 'global', got {closure!r}"
+        )
 
     m488 = m488.astype(np.int64, copy=False)
     m560 = m560.astype(np.int64, copy=False)
@@ -486,6 +606,31 @@ def union_488_560_labels(
     else:
         iomin = np.empty(0, dtype=np.float64)
 
+    n_global_dropped_488 = 0
+    n_global_dropped_560 = 0
+    if closure == "global" and pair_a.size:
+        weak_mask = (iomin > 0) & (iomin < tau)
+        if weak_mask.any():
+            bad_488 = np.unique(pair_a[weak_mask])
+            bad_560 = np.unique(pair_b[weak_mask])
+            n_global_dropped_488 = int(bad_488.size)
+            n_global_dropped_560 = int(bad_560.size)
+            if bad_488.size:
+                m488_use = np.where(np.isin(m488_use, bad_488), 0, m488_use)
+                valid_488 = valid_488.copy()
+                valid_488[bad_488] = False
+            if bad_560.size:
+                m560_use = np.where(np.isin(m560_use, bad_560), 0, m560_use)
+                valid_560 = valid_560.copy()
+                valid_560[bad_560] = False
+            pair_a, pair_b, pair_counts = _pairwise_intersections(m488_use, m560_use)
+            if pair_a.size:
+                denom = np.minimum(vol_488[pair_a], vol_560[pair_b]).astype(np.float64)
+                with np.errstate(invalid="ignore", divide="ignore"):
+                    iomin = np.where(denom > 0, pair_counts / denom, 0.0)
+            else:
+                iomin = np.empty(0, dtype=np.float64)
+
     edge_mask = iomin >= tau
     edges_a = pair_a[edge_mask]
     edges_b = pair_b[edge_mask]
@@ -514,16 +659,74 @@ def union_488_560_labels(
         root_total[int(r)] += int(vol_560[b])
         root_560_count[int(r)] += 1
 
-    sorted_roots = sorted(root_total.keys(), key=lambda r: (-root_total[r], r))
+    n_components_pre_gate = len(root_total)
+    mixed_roots = {
+        r
+        for r in root_total.keys()
+        if root_488_count[r] > 0 and root_560_count[r] > 0
+    }
+    n_dropped_unpaired = n_components_pre_gate - len(mixed_roots)
+
+    worst_iomin_per_root: dict[int, float] = {}
+    if pair_a.size:
+        pra = np.array([uf.find(int(a)) for a in pair_a.tolist()], dtype=np.int64)
+        prb = np.array(
+            [uf.find(offset + int(b)) for b in pair_b.tolist()], dtype=np.int64
+        )
+        internal = pra == prb
+        if internal.any():
+            in_roots = pra[internal]
+            in_iomin = iomin[internal]
+            order = np.argsort(in_roots, kind="stable")
+            sr = in_roots[order]
+            si = in_iomin[order]
+            u_roots, starts = np.unique(sr, return_index=True)
+            worst = np.minimum.reduceat(si, starts)
+            worst_iomin_per_root = dict(zip(u_roots.tolist(), worst.tolist()))
+
+    failed_closure = {
+        r
+        for r, w in worst_iomin_per_root.items()
+        if w < tau and r in mixed_roots
+    }
+    kept_after_closure = mixed_roots - failed_closure
+    n_dropped_closure = len(failed_closure)
+
+    kept_worsts = [
+        worst_iomin_per_root[r]
+        for r in kept_after_closure
+        if r in worst_iomin_per_root
+    ]
+    dropped_worsts = [worst_iomin_per_root[r] for r in failed_closure]
+    worst_internal_iomin_kept = (
+        float(min(kept_worsts)) if kept_worsts else float("nan")
+    )
+    worst_internal_iomin_dropped = (
+        float(min(dropped_worsts)) if dropped_worsts else float("nan")
+    )
+
+    if allow_multimerge:
+        kept_roots = kept_after_closure
+        n_dropped_multimerge = 0
+    else:
+        strict_1_1_roots = {
+            r
+            for r in kept_after_closure
+            if root_488_count[r] == 1 and root_560_count[r] == 1
+        }
+        n_dropped_multimerge = len(kept_after_closure) - len(strict_1_1_roots)
+        kept_roots = strict_1_1_roots
+
+    sorted_roots = sorted(kept_roots, key=lambda r: (-root_total[r], r))
     K = len(sorted_roots)
     root_to_id = {r: i + 1 for i, r in enumerate(sorted_roots)}
 
     lut_488 = np.zeros(n488_max + 1, dtype=np.int64)
     for a, r in zip(valid_488_ids.tolist(), roots_488.tolist()):
-        lut_488[a] = root_to_id[int(r)]
+        lut_488[a] = root_to_id.get(int(r), 0)
     lut_560 = np.zeros(n560_max + 1, dtype=np.int64)
     for b, r in zip(valid_560_ids.tolist(), roots_560.tolist()):
-        lut_560[b] = root_to_id[int(r)]
+        lut_560[b] = root_to_id.get(int(r), 0)
 
     out_488 = lut_488[m488_use]
     out_560 = lut_560[m560_use]
@@ -665,12 +868,26 @@ def union_488_560_labels(
     else:
         out = out.astype(np.uint32, copy=False)
 
+    label_map = _compute_label_map(out, lut_488, lut_560)
+
     diagnostics = {
         "N488": int(valid_488_ids.size),
         "N560": int(valid_560_ids.size),
         "tau": float(tau),
         "min_label_voxels": int(min_label_voxels),
+        "closure": str(closure),
+        "merge_policy": "multimerge" if allow_multimerge else "strict_1_1",
+        "allow_multimerge": bool(allow_multimerge),
+        "n_global_dropped_488": int(n_global_dropped_488),
+        "n_global_dropped_560": int(n_global_dropped_560),
         "edges": n_edges,
+        "n_components_pre_gate": int(n_components_pre_gate),
+        "n_dropped_unpaired": int(n_dropped_unpaired),
+        "n_dropped_closure": int(n_dropped_closure),
+        "n_dropped_multimerge": int(n_dropped_multimerge),
+        "worst_internal_iomin_kept": worst_internal_iomin_kept,
+        "worst_internal_iomin_dropped": worst_internal_iomin_dropped,
+        "label_map": label_map,
         "K": int(K_final),
         "488_only": breakdown_488_only,
         "560_only": breakdown_560_only,
@@ -694,11 +911,31 @@ def union_488_560_labels(
 def _print_diagnostics(diag: dict, out: np.ndarray) -> None:
     print(
         f"  N488={diag['N488']}, N560={diag['N560']}, "
-        f"tau={diag['tau']:.3f}, min_label_voxels={diag['min_label_voxels']}"
+        f"tau={diag['tau']:.3f}, min_label_voxels={diag['min_label_voxels']}, "
+        f"closure={diag.get('closure', 'component')}, "
+        f"merge_policy={diag.get('merge_policy', 'strict_1_1')}"
     )
+    if diag.get("closure") == "global":
+        print(
+            f"  global-closure pre-pass dropped: "
+            f"488={diag.get('n_global_dropped_488', 0)} "
+            f"560={diag.get('n_global_dropped_560', 0)}"
+        )
     print(f"  edges (IoMin >= {diag['tau']:.2f}): {diag['edges']}")
     print(
-        f"  components K = {diag['K']} "
+        f"  pre-gate components: {diag.get('n_components_pre_gate', 0)}  "
+        f"-> gate-1 dropped (unpaired): {diag.get('n_dropped_unpaired', 0)}  "
+        f"-> gate-2 dropped (closure): {diag.get('n_dropped_closure', 0)}  "
+        f"-> gate-3 dropped (n-to-m): {diag.get('n_dropped_multimerge', 0)}"
+    )
+    wik = diag.get("worst_internal_iomin_kept", float("nan"))
+    wid = diag.get("worst_internal_iomin_dropped", float("nan"))
+    print(
+        f"  worst internal IoMin: kept={wik:.4f}  dropped={wid:.4f}  "
+        f"(strict-overlap guarantee: kept >= tau={diag['tau']:.3f})"
+    )
+    print(
+        f"  components K_strict = {diag['K']} "
         f"(488_only={diag['488_only']}, 560_only={diag['560_only']}, "
         f"paired_1_1={diag['paired_1_1']}, n_to_m={diag['n_to_m']})"
     )
@@ -769,7 +1006,7 @@ def _write_union_volume(
     union_mask: np.ndarray,
     force: bool,
     *,
-    output_name: str = "union_488_560.tif",
+    output_name: str = "union_488_560_strict_overlap.tif",
 ) -> Path:
     out_path = output_dir / output_name
     if out_path.exists() and not force:
@@ -789,6 +1026,107 @@ def _write_union_volume(
     return out_path
 
 
+def _sanitize_for_json(value):
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    if isinstance(value, dict):
+        return {k: _sanitize_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_for_json(v) for v in value]
+    return value
+
+
+def _write_manifest(
+    output_dir: Path,
+    manifest_name: str,
+    diag: dict,
+    union_path: Path,
+    force: bool,
+) -> Path:
+    """Write a small JSON manifest beside the strict TIFF.
+
+    Includes the merge params, gate diagnostics, and the artifact name so
+    downstream tools (lint, QC join, audit) can reproduce the strict identity.
+    The ``label_map`` payload lives in a separate CSV; manifest stays small.
+    """
+    manifest_path = output_dir / manifest_name
+    if manifest_path.exists() and not force:
+        print(f"SKIP (exists): {manifest_path}")
+        return manifest_path
+
+    payload = {
+        "artifact": str(union_path.name),
+        "tau": diag["tau"],
+        "min_label_voxels": diag["min_label_voxels"],
+        "closure": diag.get("closure", "component"),
+        "merge_policy": diag.get("merge_policy", "strict_1_1"),
+        "conflict_rule": diag.get("conflict_rule"),
+        "conflict_merge_threshold": diag.get("conflict_merge_threshold"),
+        "split_on_disagree": diag.get("split_on_disagree"),
+        "tie_prefer": diag.get("tie_prefer"),
+        "drop_disconnected": diag.get("drop_disconnected"),
+        "connectivity": diag.get("connectivity"),
+        "smooth_radius": diag.get("smooth_radius"),
+        "N488": diag["N488"],
+        "N560": diag["N560"],
+        "edges": diag["edges"],
+        "n_global_dropped_488": diag.get("n_global_dropped_488", 0),
+        "n_global_dropped_560": diag.get("n_global_dropped_560", 0),
+        "n_components_pre_gate": diag.get("n_components_pre_gate", 0),
+        "n_dropped_unpaired": diag.get("n_dropped_unpaired", 0),
+        "n_dropped_closure": diag.get("n_dropped_closure", 0),
+        "n_dropped_multimerge": diag.get("n_dropped_multimerge", 0),
+        "worst_internal_iomin_kept": diag.get("worst_internal_iomin_kept"),
+        "worst_internal_iomin_dropped": diag.get("worst_internal_iomin_dropped"),
+        "K_strict": diag["K"],
+        "conflict_voxels": diag["conflict_voxels"],
+    }
+    tmp_path = str(manifest_path) + ".tmp"
+    with open(tmp_path, "w") as fh:
+        json.dump(_sanitize_for_json(payload), fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp_path, str(manifest_path))
+    print(f"WROTE: {manifest_path}")
+    return manifest_path
+
+
+def _write_label_map(
+    output_dir: Path,
+    label_map_name: str,
+    label_map: dict[int, dict],
+    force: bool,
+) -> Path:
+    """Write per-cell contributor table beside the strict TIFF.
+
+    Columns: ``cell_id, n_488, n_560, ids_488, ids_560, total_vox``. The id
+    lists are semicolon-joined so the file parses as plain CSV.
+    """
+    csv_path = output_dir / label_map_name
+    if csv_path.exists() and not force:
+        print(f"SKIP (exists): {csv_path}")
+        return csv_path
+
+    tmp_path = str(csv_path) + ".tmp"
+    with open(tmp_path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["cell_id", "n_488", "n_560", "ids_488", "ids_560", "total_vox"])
+        for cid in sorted(label_map.keys()):
+            entry = label_map[cid]
+            writer.writerow(
+                [
+                    cid,
+                    entry["n_488"],
+                    entry["n_560"],
+                    ";".join(str(x) for x in entry["ids_488"]),
+                    ";".join(str(x) for x in entry["ids_560"]),
+                    entry["total_vox"],
+                ]
+            )
+    os.replace(tmp_path, str(csv_path))
+    print(f"WROTE: {csv_path}  rows={len(label_map)}")
+    return csv_path
+
+
 def run(
     data_dir: Path | None,
     output_dir: Path,
@@ -796,6 +1134,8 @@ def run(
     skip_combined: bool = False,
     tau: float = 0.2,
     min_label_voxels: int = 0,
+    closure: str = "component",
+    allow_multimerge: bool = False,
     split_on_disagree: str = "off",
     tie_prefer: str = "488",
     drop_disconnected: bool = False,
@@ -803,19 +1143,30 @@ def run(
     smooth_radius: int = 0,
     conflict_rule: str = "488_wins",
     conflict_merge_threshold: float = 0.05,
-    output_name: str = "union_488_560.tif",
-    combined_name: str = "union_488_560_combined.tif",
+    output_name: str = "union_488_560_strict_overlap.tif",
+    combined_name: str = "union_488_560_strict_overlap_combined.tif",
+    manifest_name: str | None = None,
+    label_map_name: str | None = None,
 ) -> int:
+    if manifest_name is None:
+        manifest_name = output_name.replace(".tif", "_manifest.json")
+    if label_map_name is None:
+        label_map_name = output_name.replace(".tif", "_label_map.csv")
+
     print(f"Data dir:   {data_dir if data_dir else '(not provided)'}")
     print(f"Output dir: {output_dir}")
     print(f"tau:                  {tau}")
     print(f"min_label_voxels:     {min_label_voxels}")
+    print(f"closure:              {closure}")
+    print(f"merge_policy:         {'multimerge' if allow_multimerge else 'strict_1_1'}")
     print(f"conflict_rule:        {conflict_rule}  merge_threshold={conflict_merge_threshold}")
     print(f"split_on_disagree:    {split_on_disagree}  tie_prefer={tie_prefer}")
     print(f"drop_disconnected:    {drop_disconnected}  connectivity={connectivity}")
     print(f"smooth_radius:        {smooth_radius}")
     print(f"output_name:          {output_name}")
     print(f"combined_name:        {combined_name}")
+    print(f"manifest_name:        {manifest_name}")
+    print(f"label_map_name:       {label_map_name}")
     print(f"skip_combined:        {skip_combined}\n")
 
     masks: dict[str, np.ndarray] = {}
@@ -841,12 +1192,14 @@ def run(
                 masks[k] = masks[k][:z_min]
             ref_shape = masks[UNION_CHANNELS[0]].shape
 
-    print("\nIoMin label stitching...")
+    print("\nStrict-overlap IoMin label stitching...")
     union_mask, diag = union_488_560_labels(
         masks["488nm_crop"],
         masks["560nm_crop"],
         tau=tau,
         min_label_voxels=min_label_voxels,
+        closure=closure,
+        allow_multimerge=allow_multimerge,
         split_on_disagree=split_on_disagree,
         tie_prefer=tie_prefer,
         drop_disconnected=drop_disconnected,
@@ -858,11 +1211,15 @@ def run(
     _print_diagnostics(diag, union_mask)
     print()
 
-    _write_union_volume(output_dir, union_mask, force, output_name=output_name)
+    union_path = _write_union_volume(
+        output_dir, union_mask, force, output_name=output_name
+    )
+    _write_manifest(output_dir, manifest_name, diag, union_path, force)
+    _write_label_map(output_dir, label_map_name, diag.get("label_map", {}), force)
 
     combined_out = output_dir / combined_name
     if skip_combined:
-        print("SKIP: --skip-combined set; not writing union_488_560_combined.tif")
+        print(f"SKIP: --skip-combined set; not writing {combined_name}")
         print("Done.")
         return 0
     if combined_out.exists() and not force:
@@ -871,8 +1228,8 @@ def run(
         return 0
     if data_dir is None:
         print(
-            "WARNING: --data-dir not provided and --skip-combined not set; "
-            "cannot write union_488_560_combined.tif. Skipping combined.tif."
+            f"WARNING: --data-dir not provided and --skip-combined not set; "
+            f"cannot write {combined_name}. Skipping combined.tif."
         )
         print("Done.")
         return 0
@@ -912,7 +1269,7 @@ def run(
                     "642_Original",
                     "488_Original",
                     "560_Original",
-                    "Union_488_560_Mask",
+                    "Union_488_560_Strict_Overlap_Mask",
                 ]
             },
         },
@@ -937,19 +1294,45 @@ def main() -> int:
     ap.add_argument(
         "--skip-combined",
         action="store_true",
-        help="Do not write union_488_560_combined.tif (no originals needed)",
+        help="Do not write the strict-overlap combined.tif (no originals needed)",
     )
     ap.add_argument(
         "--tau",
         type=float,
         default=0.2,
-        help="IoMin threshold for fusing a 488 and 560 label (default: 0.2)",
+        help="IoMin threshold for fusing a 488 and 560 label and for the "
+             "gate-2 pairwise closure check (default: 0.2)",
     )
     ap.add_argument(
         "--min-label-voxels",
         type=int,
         default=0,
         help="Drop labels smaller than this from either channel before stitching (default: 0)",
+    )
+    ap.add_argument(
+        "--closure",
+        choices=("component", "global"),
+        default="component",
+        help=(
+            "Strict-overlap closure mode (default: component). 'component' "
+            "checks pairwise IoMin only inside each connected component "
+            "(handles transitive UF overmerges). 'global' is the stricter "
+            "opt-in rule: drop any label that has ANY cross-overlap with a "
+            "label in the other channel where 0 < IoMin < tau, then rebuild "
+            "the pair census on the cleaned masks."
+        ),
+    )
+    ap.add_argument(
+        "--allow-multimerge",
+        action="store_true",
+        help=(
+            "Allow n-to-m fusion within a component (the gate-2-only "
+            "behavior). Default is strict 1-1: every surviving cell has "
+            "exactly one 488 contributor and one 560 contributor; "
+            "components with over-segmentation or n-to-m fusion are dropped "
+            "entirely. Pass this flag to keep the relaxed multi-merge "
+            "behavior (e.g. for debugging or auditing)."
+        ),
     )
     ap.add_argument(
         "--split-on-disagree",
@@ -1017,14 +1400,26 @@ def main() -> int:
     ap.add_argument(
         "--output-name",
         type=str,
-        default="union_488_560.tif",
-        help="Output mask filename in the sample dir (default: union_488_560.tif)",
+        default="union_488_560_strict_overlap.tif",
+        help="Output mask filename (default: union_488_560_strict_overlap.tif)",
     )
     ap.add_argument(
         "--combined-name",
         type=str,
-        default="union_488_560_combined.tif",
-        help="4-channel combined.tif filename in the sample dir (default: union_488_560_combined.tif)",
+        default="union_488_560_strict_overlap_combined.tif",
+        help="4-channel combined.tif filename (default: union_488_560_strict_overlap_combined.tif)",
+    )
+    ap.add_argument(
+        "--manifest-name",
+        type=str,
+        default=None,
+        help="Manifest JSON filename (default: derived from --output-name)",
+    )
+    ap.add_argument(
+        "--label-map-name",
+        type=str,
+        default=None,
+        help="Label-map CSV filename (default: derived from --output-name)",
     )
     args = ap.parse_args()
     data_dir, output_dir = _resolve_dirs(args)
@@ -1035,6 +1430,8 @@ def main() -> int:
         skip_combined=args.skip_combined,
         tau=args.tau,
         min_label_voxels=args.min_label_voxels,
+        closure=args.closure,
+        allow_multimerge=args.allow_multimerge,
         split_on_disagree=args.split_on_disagree,
         tie_prefer=args.tie_prefer,
         drop_disconnected=args.drop_disconnected,
@@ -1044,6 +1441,8 @@ def main() -> int:
         conflict_merge_threshold=args.conflict_merge_threshold,
         output_name=args.output_name,
         combined_name=args.combined_name,
+        manifest_name=args.manifest_name,
+        label_map_name=args.label_map_name,
     )
 
 
