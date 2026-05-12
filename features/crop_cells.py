@@ -29,7 +29,7 @@ except ModuleNotFoundError:
 
 from postprocess import DEFAULT_VARIANT, VALID_VARIANTS, variant_files
 
-OUTPUT_SUBDIR_KEYS = ("cell_box", "cell_box_filtered")
+OUTPUT_SUBDIR_KEYS = ("cell_box", "cell_box_filtered", "cell_box_bg_sigma_shape", "cell_box_bg_sigma_488560_shape")
 
 MARGIN_XY_DEFAULT = 20
 MARGIN_Z_DEFAULT = 5
@@ -66,6 +66,10 @@ def _cell_box_dirnames(v: dict[str, str], output_subdir_key: str) -> tuple[str, 
         return v["cell_box"], v["cell_box_full_z"]
     if output_subdir_key == "cell_box_filtered":
         return v["cell_box_filtered"], v["cell_box_full_z_filtered"]
+    if output_subdir_key == "cell_box_bg_sigma_shape":
+        return v["cell_box_bg_sigma_shape"], v["cell_box_full_z_bg_sigma_shape"]
+    if output_subdir_key == "cell_box_bg_sigma_488560_shape":
+        return v["cell_box_bg_sigma_488560_shape"], v["cell_box_full_z_bg_sigma_488560_shape"]
     raise ValueError(f"output_subdir_key must be one of {OUTPUT_SUBDIR_KEYS}")
 
 

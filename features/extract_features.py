@@ -25,7 +25,7 @@ except ModuleNotFoundError:
 
 from postprocess import DEFAULT_VARIANT, VALID_VARIANTS, variant_files
 
-CELL_BOX_SUBDIR_KEYS = ("cell_box", "cell_box_filtered")
+CELL_BOX_SUBDIR_KEYS = ("cell_box", "cell_box_filtered", "cell_box_bg_sigma_shape", "cell_box_bg_sigma_488560_shape")
 
 CHANNEL_NAMES = ["642", "488", "560"]
 CHANNEL_PAIRS = [(0, 1), (0, 2), (1, 2)]
@@ -97,6 +97,10 @@ def _box_dirname(v: dict[str, str], cell_box_subdir_key: str) -> str:
         return v["cell_box"]
     if cell_box_subdir_key == "cell_box_filtered":
         return v["cell_box_filtered"]
+    if cell_box_subdir_key == "cell_box_bg_sigma_shape":
+        return v["cell_box_bg_sigma_shape"]
+    if cell_box_subdir_key == "cell_box_bg_sigma_488560_shape":
+        return v["cell_box_bg_sigma_488560_shape"]
     raise ValueError(f"cell_box_subdir_key must be one of {CELL_BOX_SUBDIR_KEYS}")
 
 
@@ -106,12 +110,14 @@ def run(
     variant: str = DEFAULT_VARIANT,
     cell_box_subdir_key: str = "cell_box",
     cell_ids: set[int] | None = None,
+    cell_qc_dir: str | None = None,
 ) -> int:
     v = variant_files(variant)
     box_rel = _box_dirname(v, cell_box_subdir_key)
-    print(f"Variant: {variant}  (cell_box={box_rel}, cell_qc={v['cell_qc']})")
+    qc_rel = cell_qc_dir if cell_qc_dir is not None else v["cell_qc"]
+    print(f"Variant: {variant}  (cell_box={box_rel}, cell_qc={qc_rel})")
     box_dir = output_dir / box_rel
-    qc_dir = output_dir / v["cell_qc"]
+    qc_dir = output_dir / qc_rel
     qc_dir.mkdir(parents=True, exist_ok=True)
     out_csv = qc_dir / "qc_features.csv"
     if out_csv.exists() and not force:
@@ -174,6 +180,12 @@ def main() -> int:
         help="Subfolder with cell_*.tif (default cell_box; use cell_box_filtered for QC-pruned crops).",
     )
     ap.add_argument(
+        "--cell-qc-dir",
+        type=str,
+        default=None,
+        help="Subfolder of output_dir to write qc_features.csv (default: variant cell_qc dir).",
+    )
+    ap.add_argument(
         "--cell-id",
         type=int,
         action="append",
@@ -189,6 +201,7 @@ def main() -> int:
         variant=args.variant,
         cell_box_subdir_key=args.cell_box_subdir_key,
         cell_ids=cid_set,
+        cell_qc_dir=args.cell_qc_dir,
     )
 
 
