@@ -10,7 +10,7 @@ export PYTHONUNBUFFERED=1
 
 PROJECT_ROOT="${1:?PROJECT_ROOT required as \$1}"
 OUTPUT_ROOT="${2:?OUTPUT_ROOT required as \$2}"
-VARIANT="${CMAP_CANONICAL_UMAP_VARIANT:-no_deconv_filtered_642}"
+VARIANT="${CMAP_CANONICAL_UMAP_VARIANT:-no_deconv_bg_sigma_488560_shape}"
 SKIP_PUBLISH="${CMAP_SKIP_PUBLISH:-0}"
 
 eval "$(conda shell.bash hook)"

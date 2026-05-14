@@ -66,6 +66,12 @@ DATASET_SPECS: dict[str, tuple[tuple[str, str], ...]] = {
         ("4_18_25", "cell_qc"),
         ("4_24_25_CGN_6_10_2", "cell_qc"),
     ),
+    # No-deconv union_488_560 + bg_sigma:3 runs. Use ``--output-root`` pointing
+    # at ``output_no_deconv``.
+    "no_deconv_bg_sigma_488560_shape": (
+        ("4_18_25", "cell_qc_bg_sigma_488560_shape"),
+        ("4_24_25_CGN_6_10_2", "cell_qc_bg_sigma_488560_shape"),
+    ),
 }
 
 DEFAULT_N_NEIGHBORS = (5, 15, 30)
