@@ -25,6 +25,14 @@ ROOT="$(cd "$PROJECT_ROOT" && pwd)"
 mkdir -p "$NO_DECONV_MERGE"
 MER="$(cd "$NO_DECONV_MERGE" && pwd)"
 
+# When set to 1, remove prior segmentation outputs for this sample so Cellpose
+# and downstream steps cannot skip on stale artifacts (full re-run).
+if [[ "${NO_DECONV_FORCE_OVERWRITE:-0}" == "1" ]]; then
+  for stem in 488nm_crop 560nm_crop 642nm_crop; do
+    rm -rf "${MER}/${stem}"
+  done
+fi
+
 F488="${REG}/488nm_registered.tif"
 F560="${REG}/560nm_registered.tif"
 F642="${REG}/642nm_reference.tif"

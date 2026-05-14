@@ -59,6 +59,13 @@ DATASET_SPECS: dict[str, tuple[tuple[str, str], ...]] = {
         ("4_18_25", "cell_qc_bg_sigma_488560_shape"),
         ("4_24_25_CGN_6_10_2", "cell_qc_bg_sigma_488560_shape"),
     ),
+    # No-deconv filtered_642 runs: per-sample ``cell_qc/qc_features.csv`` under
+    # e.g. ``output_no_deconv/4_18_25/<sample>/``. Use ``--output-root`` pointing
+    # at ``output_no_deconv``.
+    "no_deconv_filtered_642": (
+        ("4_18_25", "cell_qc"),
+        ("4_24_25_CGN_6_10_2", "cell_qc"),
+    ),
 }
 
 DEFAULT_N_NEIGHBORS = (5, 15, 30)

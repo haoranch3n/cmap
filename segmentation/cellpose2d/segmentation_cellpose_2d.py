@@ -3,9 +3,12 @@
 """
 from __future__ import annotations
 
+import csv
 import glob
 import os
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -24,10 +27,14 @@ try:
         AREA_THRESHOLD,
         CELLPOSE_CELLPROB_THRESHOLD,
         CELLPOSE_DIAMETERS,
+        CELLPOSE_EVAL_NORMALIZE,
         CELLPOSE_FLOW_THRESHOLD,
         CELLPOSE_PRETRAINED_MODEL,
+        SEG_PLANE_TAGS,
         SEGMENTATION_2D_DIAMETERS_DIR,
         SEGMENTATION_2D_DIR,
+        SEGMENTATION_GLOBAL_VOLUME_PERCENTILES,
+        SEGMENTATION_NORM_BOUNDS_CSV,
         TIF_PLANES_DIR,
         strip_path_shared_with_output_mirror,
     )
@@ -36,10 +43,14 @@ except ModuleNotFoundError:
         AREA_THRESHOLD,
         CELLPOSE_CELLPROB_THRESHOLD,
         CELLPOSE_DIAMETERS,
+        CELLPOSE_EVAL_NORMALIZE,
         CELLPOSE_FLOW_THRESHOLD,
         CELLPOSE_PRETRAINED_MODEL,
+        SEG_PLANE_TAGS,
         SEGMENTATION_2D_DIAMETERS_DIR,
         SEGMENTATION_2D_DIR,
+        SEGMENTATION_GLOBAL_VOLUME_PERCENTILES,
+        SEGMENTATION_NORM_BOUNDS_CSV,
         TIF_PLANES_DIR,
         strip_path_shared_with_output_mirror,
     )
@@ -56,15 +67,101 @@ except Exception:
 from cellpose import models
 
 
-def discover_dapi_tifs(tif_planes_root: Path):
-    return sorted(glob.glob(str(tif_planes_root / "**" / "*_DAPI.tif"), recursive=True))
+def discover_seg_plane_tifs(tif_planes_root: Path) -> list[str]:
+    """Find all per-Z segmentation input planes for any known channel tag."""
+    found: set[str] = set()
+    for tag in SEG_PLANE_TAGS:
+        found.update(glob.glob(str(tif_planes_root / "**" / f"*_{tag}.tif"), recursive=True))
+    return sorted(found)
 
 
-def plane_stem_from_dapi_path(dapi_path: str) -> str:
-    base = os.path.basename(dapi_path)
-    if base.endswith("_DAPI.tif"):
-        return base[: -len("_DAPI.tif")]
+# Backward-compat alias used by run_segmentation internals.
+discover_dapi_tifs = discover_seg_plane_tifs
+
+
+def plane_stem_from_seg_path(seg_path: str) -> str:
+    """Strip the known channel-tag suffix (e.g. ``_488``, ``_DAPI``) from a plane filename."""
+    base = os.path.basename(seg_path)
+    for tag in SEG_PLANE_TAGS:
+        suffix = f"_{tag}.tif"
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
     return Path(base).stem
+
+
+# Backward-compat alias.
+plane_stem_from_dapi_path = plane_stem_from_seg_path
+
+
+_PLANE_TZ_RE = re.compile(r"_t(\d+)_z(\d+)_")
+
+
+def sort_plane_paths_by_tz(plane_paths: list[str]) -> list[str]:
+    """Order Z planes consistently (lexical z order is wrong for non-padded indices)."""
+
+    def sort_key(p: str) -> tuple:
+        m = _PLANE_TZ_RE.search(os.path.basename(p))
+        if m:
+            return (0, int(m.group(1)), int(m.group(2)))
+        return (1, os.path.basename(p))
+
+    return sorted(plane_paths, key=sort_key)
+
+
+def group_dapi_paths_by_volume_dir(dapi_files: list[str]) -> dict[str, list[str]]:
+    """One 3D stack = all *_DAPI.tif in the same directory (matches preprocess output layout)."""
+    groups: dict[str, list[str]] = defaultdict(list)
+    for p in dapi_files:
+        groups[os.path.realpath(os.path.dirname(p))].append(p)
+    return {k: sort_plane_paths_by_tz(v) for k, v in groups.items()}
+
+
+def dapi_volume_percentile_bounds(
+    plane_paths: list[str], p_low: float, p_high: float
+) -> tuple[float, float]:
+    """Single-channel (DAPI): global percentiles over all voxels in all planes."""
+    chunks: list[np.ndarray] = []
+    for path in plane_paths:
+        img = imread(path)
+        if img.ndim == 3:
+            img = img.squeeze()
+        if img.ndim != 2:
+            raise ValueError(f"Expected 2D plane, got shape {getattr(img, 'shape', None)} for {path}")
+        chunks.append(np.asarray(img, dtype=np.float32).ravel())
+    if not chunks:
+        return 0.0, 1.0
+    flat = np.concatenate(chunks)
+    lo, hi = np.percentile(flat, [p_low, p_high])
+    lo_f, hi_f = float(lo), float(hi)
+    if hi_f - lo_f <= 1e-3:
+        return 0.0, 1.0
+    return lo_f, hi_f
+
+
+def apply_global_volume_affine(img: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """Affine normalize: (x - lo) / (hi - lo); no clipping."""
+    x = np.asarray(img, dtype=np.float32)
+    if x.ndim == 3:
+        x = x.squeeze()
+    return (x - lo) / (hi - lo)
+
+
+def read_norm_bounds_csv(csv_path: Path) -> tuple[float, float] | None:
+    """Read channel 0 (lo, hi) from a ``segmentation_norm_bounds.csv``.
+
+    Returns ``None`` if the file does not exist or is unreadable, so callers
+    can fall back to computing bounds from the plane files.
+    """
+    try:
+        with open(csv_path, newline="") as fh:
+            for row in csv.reader(fh):
+                if not row or row[0].startswith("#") or row[0] == "channel_index":
+                    continue
+                if int(row[0]) == 0:
+                    return float(row[1]), float(row[2])
+    except Exception:
+        pass
+    return None
 
 
 def diameter_mask_dir(dapi_path: str, tif_planes_root: str, diameters_root: str) -> str:
@@ -266,13 +363,22 @@ def run_segmentation(tif_planes_root=None, seg_root=None, diameters_root=None, p
 
     dapi_files = discover_dapi_tifs(tif_planes_root)
     if not dapi_files:
-        print(f"No *_DAPI.tif files under {tif_planes_root}")
+        print(f"No segmentation input planes (*_488/560/642/DAPI/seg.tif) found under {tif_planes_root}")
         return
+
+    volume_groups = group_dapi_paths_by_volume_dir(dapi_files)
+    volume_pct_bounds: dict[str, tuple[float, float]] = {}
+    p_lo, p_hi = SEGMENTATION_GLOBAL_VOLUME_PERCENTILES
 
     diameters = CELLPOSE_DIAMETERS
     print(f"Using Cellpose pretrained_model={pretrained_model!r}, gpu={gpu}")
     print(f"Diameters: {diameters}")
-    print(f"Found {len(dapi_files)} DAPI plane(s).")
+    print(f"Found {len(dapi_files)} seg-input plane(s) in {len(volume_groups)} volume folder(s).")
+    print(
+        f"Cellpose eval normalize={CELLPOSE_EVAL_NORMALIZE!r}  "
+        f"[global volume percentiles={SEGMENTATION_GLOBAL_VOLUME_PERCENTILES!r} "
+        f"applied when Cellpose normalize is off]"
+    )
     model = models.CellposeModel(gpu=gpu, pretrained_model=pretrained_model)
 
     print("\n=== Phase 1: Multi-diameter Cellpose segmentation ===")
@@ -291,7 +397,30 @@ def run_segmentation(tif_planes_root=None, seg_root=None, diameters_root=None, p
             img = img.squeeze()
         if img.ndim != 2:
             raise ValueError(f"Expected 2D plane, got shape {img.shape} for {dapi_path}")
-        img = np.asarray(img, dtype=np.float32)
+        if not CELLPOSE_EVAL_NORMALIZE:
+            vol_dir = os.path.realpath(os.path.dirname(dapi_path))
+            if vol_dir not in volume_pct_bounds:
+                # 1. Try CSV written by separate_channels.py (preferred: avoids re-reading all planes).
+                csv_path = Path(vol_dir) / SEGMENTATION_NORM_BOUNDS_CSV
+                bounds_from_csv = read_norm_bounds_csv(csv_path)
+                if bounds_from_csv is not None:
+                    lo_b, hi_b = bounds_from_csv
+                    print(
+                        f"  Norm bounds from CSV: lo={lo_b:.6g} hi={hi_b:.6g}  ({csv_path})"
+                    )
+                else:
+                    # 2. Fallback: compute from plane files (no CSV present).
+                    plane_paths = volume_groups[vol_dir]
+                    lo_b, hi_b = dapi_volume_percentile_bounds(plane_paths, p_lo, p_hi)
+                    print(
+                        f"  Norm bounds computed from planes [{p_lo},{p_hi}]: "
+                        f"lo={lo_b:.6g} hi={hi_b:.6g} ({len(plane_paths)} plane(s), {vol_dir})"
+                    )
+                volume_pct_bounds[vol_dir] = (lo_b, hi_b)
+            lo_b, hi_b = volume_pct_bounds[vol_dir]
+            img = apply_global_volume_affine(img, lo_b, hi_b)
+        else:
+            img = np.asarray(img, dtype=np.float32)
         for diameter in diameters:
             out_path = os.path.join(dm_dir, f"{stem}_diameter_{diameter}.tif")
             if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
@@ -300,7 +429,7 @@ def run_segmentation(tif_planes_root=None, seg_root=None, diameters_root=None, p
                 img,
                 diameter=diameter,
                 channels=None,
-                normalize=True,
+                normalize=CELLPOSE_EVAL_NORMALIZE,
                 flow_threshold=CELLPOSE_FLOW_THRESHOLD,
                 cellprob_threshold=CELLPOSE_CELLPROB_THRESHOLD,
             )

@@ -21,12 +21,20 @@
 #   CMAP_SAMPLE_FILTER          — substring filter on sample dir name
 #   CMAP_NO_DECONV_QUEUE        — LSF GPU queue (default: gpu). Example:
 #                                 CMAP_NO_DECONV_QUEUE=rhel88_gpu
+#   CMAP_NO_DECONV_BSUB_MEM_MB  — rusage[mem=...] in MB (default: 65536)
+#   CMAP_NO_DECONV_BSUB_WALLTIME — LSF -W run limit in minutes (default: 1440)
+#   CMAP_NO_DECONV_BSUB_GPU_RES — passed to bsub -gpu (default: num=1:j_exclusive=yes)
+#   CMAP_NO_DECONV_BSUB_SLOTS   — bsub -n slots (default: 1)
 #
 # Queue: gpu (Cellpose). No email flags.
 
 set -euo pipefail
 
 QUEUE="${CMAP_NO_DECONV_QUEUE:-gpu}"
+BSUB_MEM_MB="${CMAP_NO_DECONV_BSUB_MEM_MB:-65536}"
+BSUB_WALLTIME="${CMAP_NO_DECONV_BSUB_WALLTIME:-1440}"
+BSUB_GPU_RES="${CMAP_NO_DECONV_BSUB_GPU_RES:-num=1:j_exclusive=yes}"
+BSUB_SLOTS="${CMAP_NO_DECONV_BSUB_SLOTS:-1}"
 
 PROJECT_ROOT="${CMAP_REPO_ROOT:-/research_jude/rgs01_jude/dept/DNB/core_operations/ImageAnalysis/Core/Haoran/cmap}"
 PROJECT_ROOT="$(cd "$PROJECT_ROOT" && pwd)"
@@ -120,14 +128,14 @@ for dataset in $DATASETS; do
       continue
     fi
 
-    echo "  Submit: $dataset/$sam -> $MERGE  (queue=$QUEUE)"
+    echo "  Submit: $dataset/$sam -> $MERGE  (queue=$QUEUE mem=${BSUB_MEM_MB}MB -W=${BSUB_WALLTIME} -n=${BSUB_SLOTS})"
     bsub \
       -J "$job" \
       -q "$QUEUE" \
-      -gpu "num=1:j_exclusive=yes" \
-      -n 1 \
-      -R "rusage[mem=65536] span[hosts=1]" \
-      -W 1440 \
+      -gpu "$BSUB_GPU_RES" \
+      -n "$BSUB_SLOTS" \
+      -R "rusage[mem=${BSUB_MEM_MB}] span[hosts=1]" \
+      -W "$BSUB_WALLTIME" \
       -o "${LOG_DIR}/${sam}_%J.out" \
       -e "${LOG_DIR}/${sam}_%J.err" \
       bash -lc "set -euo pipefail
