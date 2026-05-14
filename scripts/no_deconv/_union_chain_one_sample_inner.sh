@@ -41,12 +41,10 @@ QC_DIR="cell_qc_bg_sigma_488560_shape"
 echo "=== $(date -Is) START union chain (no-deconv): $SAMPLE_DIR ==="
 
 # 1. Strict 488+560 overlap mask
-# --combined-name must match the name expected by filter_by_intensity.py (variant_files["union_488_560"]["combined"])
 echo "" && echo ">>> postprocess.union_488_560_mask"
 "$PY" postprocess/union_488_560_mask.py \
-  --output-dir    "$SAMPLE_DIR" \
-  --data-dir      "$SAMPLE_DIR" \
-  --combined-name union_488_560_combined.tif \
+  --output-dir "$SAMPLE_DIR" \
+  --data-dir   "$SAMPLE_DIR" \
   $FORCE_FLAG
 
 # 2. Intensity + shape QC (bg_sigma:3, only 488+560 must pass)

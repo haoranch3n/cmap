@@ -1144,7 +1144,7 @@ def run(
     conflict_rule: str = "488_wins",
     conflict_merge_threshold: float = 0.05,
     output_name: str = "union_488_560_strict_overlap.tif",
-    combined_name: str = "union_488_560_strict_overlap_combined.tif",
+    combined_name: str = "union_488_560_combined.tif",
     manifest_name: str | None = None,
     label_map_name: str | None = None,
 ) -> int:
@@ -1406,8 +1406,8 @@ def main() -> int:
     ap.add_argument(
         "--combined-name",
         type=str,
-        default="union_488_560_strict_overlap_combined.tif",
-        help="4-channel combined.tif filename (default: union_488_560_strict_overlap_combined.tif)",
+        default="union_488_560_combined.tif",
+        help="4-channel combined.tif filename (default: union_488_560_combined.tif)",
     )
     ap.add_argument(
         "--manifest-name",
