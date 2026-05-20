@@ -68,7 +68,8 @@ SEGMENTATION_GLOBAL_VOLUME_PERCENTILES: tuple[float, float] = (0.0, 99.99)
 # Written by preprocessing/extract_channel.py and read by Cellpose 2D step.
 SEGMENTATION_NORM_BOUNDS_CSV = "segmentation_norm_bounds.csv"
 # Cellpose normalize=False because we pre-normalize from full FOV bounds.
-CELLPOSE_EVAL_NORMALIZE = False
+# Override with env var CELLPOSE_EVAL_NORMALIZE=true for experiments.
+CELLPOSE_EVAL_NORMALIZE: bool = os.environ.get("CELLPOSE_EVAL_NORMALIZE", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Cellpose
