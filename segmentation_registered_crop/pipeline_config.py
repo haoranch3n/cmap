@@ -22,7 +22,7 @@ CROPS_ROOT = _path_from_env(
     "CROPS_ROOT",
     Path(
         "/research/dept/dnb/core_operations/ImageAnalysisScratch/Gutierrez/"
-        "CMAP_general/No_decon_tests/outputs/cell_crops/batch_processing"
+        "CMAP_general/No_decon_tests/outputs/cell_crops/batch_processing_fullZ"
     ),
 )
 
