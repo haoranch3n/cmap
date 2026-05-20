@@ -62,7 +62,7 @@ TEST_CELLS: list[tuple[str, str, str]] = [
     ("4_18_25",            "CGNSample1_Position0", "cell_0010"),
     ("4_18_25",            "CGNSample1_Position2", "cell_0013"),
     ("4_18_25",            "CGNSample1_Position4", "cell_0005"),
-    ("4_24_25_CGN_6_10_2", "Sample10_Position1",   "cell_0010"),
+    ("4_24_25_CGN_6_10_2", "Sample10_Position0",   "cell_0002"),  # replaced: cell_0010@P1 crop missing
 ]
 
 OUTPUT_ROOT_ORTHO = REPO_ROOT = Path(__file__).resolve().parents[2] / "output_registered_crop_seg_ortho3d"
