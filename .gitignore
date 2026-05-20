@@ -7,6 +7,7 @@ __pycache__/
 # Local pipeline outputs (regenerate)
 output/
 output_no_deconv/
+output_registered/
 
 # Standalone project with its own git history (track separately or submodule)
 napari-plugin/

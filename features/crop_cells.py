@@ -146,6 +146,49 @@ def _five_channel_crop(
     return crop_5ch, stats
 
 
+def write_coordinates_csv(
+    filtered_mask_path: Path,
+    box_dir: Path,
+    margin_xy: int = MARGIN_XY_DEFAULT,
+    margin_z: int = MARGIN_Z_DEFAULT,
+    force: bool = False,
+) -> Path:
+    """Write cell_coordinates.csv with padded crop bbox for every cell in the mask.
+
+    Columns: cell_id, z0, z1, y0, y1, x0, x1 — the exact indices used to slice
+    the volume when generating cell TIFs (tight bbox ± margin, clamped to volume).
+    This file is written independently of whether TIF crops exist or are regenerated.
+    """
+    coords_path = box_dir / "cell_coordinates.csv"
+    if coords_path.exists() and not force:
+        print(f"SKIP (exists): {coords_path}  (use --force to overwrite)")
+        return coords_path
+
+    mask = _load_3d(filtered_mask_path)
+    vol_z, vol_y, vol_x = mask.shape
+    rows: list[dict] = []
+    for p in regionprops(mask.astype(np.int32)):
+        bz0, by0, bx0, bz1, by1, bx1 = p.bbox
+        rows.append({
+            "cell_id": p.label,
+            "z0": max(0, bz0 - margin_z),
+            "z1": min(vol_z, bz1 + margin_z),
+            "y0": max(0, by0 - margin_xy),
+            "y1": min(vol_y, by1 + margin_xy),
+            "x0": max(0, bx0 - margin_xy),
+            "x1": min(vol_x, bx1 + margin_xy),
+        })
+
+    box_dir.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["cell_id", "z0", "z1", "y0", "y1", "x0", "x1"]
+    with open(str(coords_path), "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"Coordinates CSV: {coords_path}  ({len(rows)} cells)")
+    return coords_path
+
+
 def run(
     data_dir: Path,
     output_dir: Path,
@@ -157,6 +200,7 @@ def run(
     label_mask_name: str | None = None,
     output_subdir_key: str = "cell_box",
     cell_ids: set[int] | None = None,
+    coords_only: bool = False,
 ) -> int:
     v = variant_files(variant)
     if output_subdir_key not in OUTPUT_SUBDIR_KEYS:
@@ -170,12 +214,29 @@ def run(
         f"out_subdir={output_subdir_key})"
     )
     print(f"Margin: XY={margin_xy}  Z={margin_z}" + ("  also_full_z=1" if also_full_z else ""))
-    combined_path = output_dir / v["combined"]
+    if coords_only:
+        print("Mode: coords-only (no TIF crops)")
+
     filtered_mask_path = output_dir / mask_fname
-    for p, name in [(combined_path, v["combined"]), (filtered_mask_path, mask_fname)]:
-        if not p.exists():
-            print(f"ERROR: {name} not found: {p}")
-            return 1
+    if not filtered_mask_path.exists():
+        print(f"ERROR: {mask_fname} not found: {filtered_mask_path}")
+        return 1
+
+    box_dir = output_dir / box_rel
+    full_z_dir = output_dir / full_z_rel
+    summary_path = box_dir / "summary.csv"
+    full_z_summary_path = full_z_dir / "summary.csv"
+
+    # --coords-only: just write the coordinates CSV and exit
+    if coords_only:
+        write_coordinates_csv(filtered_mask_path, box_dir, margin_xy, margin_z, force)
+        print("Done.")
+        return 0
+
+    combined_path = output_dir / v["combined"]
+    if not combined_path.exists():
+        print(f"ERROR: {v['combined']} not found: {combined_path}")
+        return 1
 
     if variant == "filtered_642":
         try:
@@ -190,17 +251,14 @@ def run(
         # the natural meaning under the union variant.
         unfiltered_mask_path = filtered_mask_path
 
-    box_dir = output_dir / box_rel
-    full_z_dir = output_dir / full_z_rel
-    summary_path = box_dir / "summary.csv"
-    full_z_summary_path = full_z_dir / "summary.csv"
-
     run_padded = force or not summary_path.exists()
     run_full_z_pass = also_full_z and (force or not full_z_summary_path.exists())
 
     if not also_full_z:
         if summary_path.exists() and not force:
             print(f"SKIP (exists): {summary_path}  (use --force to overwrite)")
+            write_coordinates_csv(filtered_mask_path, box_dir, margin_xy, margin_z, force)
+            print("Done.")
             return 0
         run_padded = True
         run_full_z_pass = False
@@ -209,6 +267,8 @@ def run(
             f"SKIP (exists): {summary_path} and {full_z_summary_path}  (use --force to overwrite)",
             flush=True,
         )
+        write_coordinates_csv(filtered_mask_path, box_dir, margin_xy, margin_z, force)
+        print("Done.")
         return 0
 
     if run_padded:
@@ -339,6 +399,7 @@ def run(
     elif run_full_z_pass:
         print("No cells found (full-z pass).")
 
+    write_coordinates_csv(filtered_mask_path, box_dir, margin_xy, margin_z, force)
     print("Done.")
     return 0
 
@@ -382,6 +443,11 @@ def main() -> int:
         default=None,
         help="Only crop these cell ids (repeatable). Omit for all labels in mask.",
     )
+    ap.add_argument(
+        "--coords-only",
+        action="store_true",
+        help="Write cell_coordinates.csv without regenerating TIF crops.",
+    )
     args = ap.parse_args()
     data_dir, output_dir = _resolve_dirs(args)
     cid_set = set(args.cell_id) if args.cell_id else None
@@ -396,6 +462,7 @@ def main() -> int:
         label_mask_name=args.label_mask_name,
         output_subdir_key=args.output_subdir_key,
         cell_ids=cid_set,
+        coords_only=args.coords_only,
     )
 
 
