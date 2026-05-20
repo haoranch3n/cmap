@@ -33,6 +33,22 @@ OUTPUT_ROOT_DEFAULT = Path(
 )
 
 
+def compute_2d_boundaries(mask_3d: np.ndarray) -> np.ndarray:
+    """
+    Compute thick 2D boundary per Z-slice.
+
+    Runs find_boundaries independently on each Z-plane so the boundary shows
+    the cell outline in every slice, rather than the surface of the 3D volume.
+    """
+    boundary = np.zeros_like(mask_3d, dtype=np.uint8)
+    for z in range(mask_3d.shape[0]):
+        if mask_3d[z].any():
+            boundary[z] = find_boundaries(
+                mask_3d[z].astype(bool), mode="thick", connectivity=1
+            ).astype(np.uint8)
+    return boundary
+
+
 def combine_one_cell(cell_dir: Path, force: bool = False) -> str:
     """
     Combine the three per-channel masks for one cell directory.
@@ -85,9 +101,7 @@ def combine_one_cell(cell_dir: Path, force: bool = False) -> str:
             (union_mask,    out_union),
             (majority_mask, out_majority),
         ]:
-            boundary = find_boundaries(
-                combined_mask.astype(bool), mode="thick", connectivity=1
-            ).astype(np.uint8)
+            boundary = compute_2d_boundaries(combined_mask)
 
             out_arr = np.zeros((z, 5, h, w), dtype=np.float32)
             out_arr[:, :3] = intensities

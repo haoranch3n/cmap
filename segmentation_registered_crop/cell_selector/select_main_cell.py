@@ -107,17 +107,39 @@ def select_main_cell(
     }
 
 
+def compute_2d_boundaries(mask_3d: np.ndarray) -> np.ndarray:
+    """
+    Compute thick 2D boundary per Z-slice.
+
+    Runs find_boundaries independently on each Z-plane so the boundary shows
+    the cell outline in every slice, rather than the surface of the 3D volume.
+
+    Args:
+        mask_3d: (Z, Y, X) uint8 binary mask.
+
+    Returns:
+        (Z, Y, X) uint8 — 1 on 2D boundary pixels, per slice.
+    """
+    boundary = np.zeros_like(mask_3d, dtype=np.uint8)
+    for z in range(mask_3d.shape[0]):
+        if mask_3d[z].any():
+            boundary[z] = find_boundaries(
+                mask_3d[z].astype(bool), mode="thick", connectivity=1
+            ).astype(np.uint8)
+    return boundary
+
+
 def build_main_cell_mask(indexed_mask_tif: Path, selected_label: int) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build binary mask and boundary map for *selected_label*.
+    Build binary mask and per-slice 2D boundary map for *selected_label*.
 
     Returns:
         mask     (Z, Y, X) uint8 — 0=background, 1=main cell
-        boundary (Z, Y, X) uint8 — 1 on cell surface (thick boundary)
+        boundary (Z, Y, X) uint8 — 1 on 2D boundary pixels per Z-slice
     """
     seg_3d = tifffile.imread(str(indexed_mask_tif)).astype(np.int32)
     mask = (seg_3d == selected_label).astype(np.uint8)
-    boundary = find_boundaries(mask.astype(bool), mode="thick", connectivity=1).astype(np.uint8)
+    boundary = compute_2d_boundaries(mask)
     return mask, boundary
 
 
