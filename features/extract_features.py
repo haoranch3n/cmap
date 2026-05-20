@@ -32,6 +32,8 @@ CELL_BOX_SUBDIR_KEYS = (
     "cell_box_bg_sigma_488560_shape",
     # Registered-crop pipeline: per-cell combined_union.tif staged and z±5 clipped.
     "cell_box_union_registered",
+    # Registered-crop pipeline: 488+560 channel union only, z±5 clipped.
+    "cell_box_union_488_560",
 )
 
 CHANNEL_NAMES = ["642", "488", "560"]
@@ -111,6 +113,8 @@ def _box_dirname(v: dict[str, str], cell_box_subdir_key: str) -> str:
     # Keys that map directly to their own directory name (no variant lookup needed).
     if cell_box_subdir_key == "cell_box_union_registered":
         return "cell_box_union_registered"
+    if cell_box_subdir_key == "cell_box_union_488_560":
+        return "cell_box_union_488_560"
     raise ValueError(f"cell_box_subdir_key must be one of {CELL_BOX_SUBDIR_KEYS}")
 
 
