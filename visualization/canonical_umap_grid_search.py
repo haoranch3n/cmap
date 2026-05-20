@@ -79,6 +79,13 @@ DATASET_SPECS: dict[str, tuple[tuple[str, str], ...]] = {
         ("4_18_25", "cell_qc_union_registered"),
         ("4_24_25_CGN_6_10_2", "cell_qc_union_registered"),
     ),
+    # Registered-crop segmentation: 488+560 channel union only, z±5 clipped.
+    # Use ``--output-root`` pointing at ``output_registered_crop_seg``.
+    # Output: cell_qc_all/canonical_embedding_union_488_560_registered_all.csv
+    "union_488_560_registered": (
+        ("4_18_25", "cell_qc_union_488_560"),
+        ("4_24_25_CGN_6_10_2", "cell_qc_union_488_560"),
+    ),
 }
 
 DEFAULT_N_NEIGHBORS = (5, 15, 30)
