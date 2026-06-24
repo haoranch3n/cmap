@@ -1,0 +1,11 @@
+name: cmap-cell-exemption-plugin
+display_name: CMAP Cell Exemption
+schema_version: 0.2.1
+contributions:
+  commands:
+    - id: cmap-cell-exemption-plugin.make_widget
+      title: Open CMAP Cell Exemption
+      python_name: cmap_cell_exemption_plugin.widget:CellExemptionWidget
+  widgets:
+    - command: cmap-cell-exemption-plugin.make_widget
+      display_name: CMAP Cell Exemption

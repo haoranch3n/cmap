@@ -1,0 +1,14 @@
+# Data symlink farms and reviewer annotation outputs (local, not source)
+real_data/
+test_data/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Editor swap files
+*.swp
