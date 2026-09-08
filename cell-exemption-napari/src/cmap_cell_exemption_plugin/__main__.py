@@ -5,9 +5,10 @@ Usage:
     python -m cmap_cell_exemption_plugin --check
 
 If OUTPUT_ROOT is provided, the plugin discovers reconstructed samples under
-that root immediately. ``--annotation-dir`` preselects the CSV output folder
-(and loads any prior annotations there). ``--check`` runs environment
-diagnostics instead of launching the GUI.
+that root immediately. ``--annotation-dir`` preselects the CSV output root; this
+session's file is written to ``<dir>/<reviewer>/<YYYYMMDD>/`` beneath it. Prior
+annotations in that folder are left alone, not loaded back into the widget.
+``--check`` runs environment diagnostics instead of launching the GUI.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ def _parse_args() -> argparse.Namespace:
         dest="annotation_dir",
         default=None,
         metavar="DIR",
-        help="Folder where annotation CSVs are saved/loaded.",
+        help="Root folder for annotation CSVs (filed under <reviewer>/<date>/).",
     )
     parser.add_argument(
         "--check",

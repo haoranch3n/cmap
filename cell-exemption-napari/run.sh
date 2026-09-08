@@ -16,7 +16,7 @@
 # CSVs without duplicating storage. Rebuild it any time with:
 #   bash setup_real_symlinks.sh
 #
-# The default CSV output folder is real_data/annotations (override with
+# The default CSV output folder is annotations/<reviewer>/<date>/ (override with
 # --annotation-dir /some/path).
 
 # Prefer logical cwd so symlink/nfs paths stay usable from the GUI
@@ -39,8 +39,9 @@ if [[ "$HAS_POSITIONAL" -eq 0 ]] && [[ "$*" != *"--check"* ]] && [[ -d "$DEFAULT
     set -- "$DEFAULT_ROOT" "$@"
 fi
 
-# Default CSV output folder = real_data/annotations (override with --annotation-dir).
-DEFAULT_ANN="$SCRIPT_DIR/real_data/annotations"
+# Default CSV output folder = annotations/ (the plugin files sessions under
+# <reviewer>/<date>/ inside it). Override with --annotation-dir.
+DEFAULT_ANN="$SCRIPT_DIR/annotations"
 if [[ "$*" != *"--check"* ]] && [[ "$*" != *"--annotation-dir"* ]]; then
     set -- "$@" --annotation-dir "$DEFAULT_ANN"
 fi

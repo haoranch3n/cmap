@@ -102,16 +102,35 @@ Prefer `run.sh` when the `napari` module is available.
 
 ## Annotation CSV
 
-Choose an annotation output folder in the widget. The plugin writes a timestamped
-CSV:
+Choose an annotation output folder in the widget (`run.sh` defaults to
+`annotations/` beside this README). Each session is filed under the reviewer
+name and the session date:
 
 ```text
-cell_exemption_annotations_YYYYMMDD_HHMMSS.csv
+annotations/
+  <reviewer>/
+    <YYYYMMDD>/
+      cell_exemption_annotations_<HHMMSS>.csv
 ```
 
-Prior files matching `cell_exemption_annotations*.csv` in the same folder are
-loaded oldest-first so work can resume. Newer rows override older rows with the
-same `(image_path, annotation_type, cell_id)` key.
+The reviewer directory comes from the widget's `Reviewer` field, which is
+prefilled from `$USER`; sessions with the field cleared land under `unknown/`.
+The timestamp is fixed when the widget opens, so one session writes exactly one
+CSV holding every annotation made in it, across all samples, rewritten in full
+on each save.
+
+Annotations are saved automatically: on Previous/Next, on a sample-dropdown
+change, when a new output root is opened, and on widget close or application
+quit — plus `Ctrl+S`. Writes go through a temp file and `os.replace`, so an
+interrupted save cannot corrupt an existing CSV. There is no periodic autosave,
+so a hard kill still loses work done since the last of those events.
+
+Note that a new session does **not** load prior CSVs back into the widget: each
+run starts empty and writes its own file, leaving earlier ones untouched.
+`load_annotation_folder()` can merge a folder's CSVs oldest-first (newer rows
+overriding older ones with the same `(image_path, annotation_type, cell_id)`
+key) and recurses into the `<reviewer>/<date>/` tree, but the widget does not
+call it.
 
 Columns start with `image_name,cell_id`:
 

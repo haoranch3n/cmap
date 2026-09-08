@@ -121,3 +121,62 @@ def test_path_key_normalizes_mount_alias() -> None:
         "ImageAnalysis/Core/Haoran/cmap/foo.tif"
     )
     assert path_key(jude) == path_key(dept)
+
+
+def _minimal_row(cell_id: str = "1") -> AnnotationRow:
+    """Smallest annotation row that round-trips through the CSV writer."""
+    return AnnotationRow(
+        image_name=COMBINED_TIFF_NAME,
+        cell_id=cell_id,
+        annotation_type=MISSING_CELL,
+        label="missing",
+        batch="batchA",
+        sample="Sample1",
+        image_path=f"/fake/{cell_id}/{COMBINED_TIFF_NAME}",
+    )
+
+
+def test_annotation_path_files_session_under_reviewer_then_date(tmp_path: Path) -> None:
+    out = annotation_csv_path(tmp_path / "ann", "20260908_223023", "hchen19")
+    assert out == tmp_path / "ann" / "hchen19" / "20260908" / (
+        "cell_exemption_annotations_223023.csv"
+    )
+
+
+def test_same_day_sessions_share_a_date_dir_but_not_a_file(tmp_path: Path) -> None:
+    a = annotation_csv_path(tmp_path / "ann", "20260908_090000", "hchen19")
+    b = annotation_csv_path(tmp_path / "ann", "20260908_223023", "hchen19")
+    assert a.parent == b.parent
+    assert a.name != b.name
+
+
+def test_annotation_path_without_reviewer_uses_unknown_dir(tmp_path: Path) -> None:
+    out = annotation_csv_path(tmp_path / "ann", "20260908_223023", "")
+    assert out.parent == tmp_path / "ann" / "unknown" / "20260908"
+
+
+def test_reviewer_name_cannot_escape_the_annotation_root(tmp_path: Path) -> None:
+    root = (tmp_path / "ann").resolve()
+    for hostile in ("../..", "/etc", "a/../../b"):
+        out = annotation_csv_path(root, "20260908_223023", hostile).resolve()
+        assert root in out.parents, f"{hostile!r} escaped to {out}"
+
+
+def test_load_annotation_folder_finds_nested_sessions(tmp_path: Path) -> None:
+    root = tmp_path / "ann"
+    save_annotations_atomic(
+        annotation_csv_path(root, "20260907_100000", "alice"), [_minimal_row("1")]
+    )
+    save_annotations_atomic(
+        annotation_csv_path(root, "20260908_110000", "bob"), [_minimal_row("2")]
+    )
+    loaded = load_annotation_folder(root)
+    assert len(loaded) == 2
+
+
+def test_load_annotation_folder_still_reads_pre_migration_flat_csvs(tmp_path: Path) -> None:
+    root = tmp_path / "ann"
+    root.mkdir()
+    save_annotations_atomic(root / "cell_exemption_annotations_legacy.csv", [_minimal_row("9")])
+    loaded = load_annotation_folder(root)
+    assert len(loaded) == 1

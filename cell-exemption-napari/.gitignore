@@ -1,6 +1,7 @@
 # Data symlink farms and reviewer annotation outputs (local, not source)
 real_data/
 test_data/
+annotations/
 
 # Python caches and build artifacts
 __pycache__/

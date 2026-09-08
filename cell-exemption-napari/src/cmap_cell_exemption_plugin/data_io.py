@@ -261,24 +261,37 @@ def sanitize_filename_token(text: str | None) -> str:
     return text.strip("_.-")
 
 
+#: Directory used when no reviewer name is available, so a session still lands
+#: somewhere predictable instead of at the annotation root.
+UNKNOWN_REVIEWER_DIR = "unknown"
+
+
 def annotation_csv_path(
     output_dir: Path, stamp: str | None = None, reviewer: str | None = None
 ) -> Path:
     """Return the current session annotation CSV path.
 
-    When a ``reviewer`` is given, it is sanitized and embedded in the filename
-    so each reviewer's output is easy to identify, e.g.
-    ``cell_exemption_annotations_<reviewer>_<stamp>.csv``.
+    Sessions are filed under ``<reviewer>/<date>/`` rather than dumped into one
+    flat directory, so a reviewer's work for a given day stays together and the
+    annotation root does not grow an unbounded list of sibling CSVs::
+
+        <output_dir>/<reviewer>/<YYYYMMDD>/cell_exemption_annotations_<HHMMSS>.csv
+
+    ``stamp`` is the ``YYYYMMDD_HHMMSS`` session stamp; its date half becomes
+    the directory and its time half the filename. A stamp without that shape is
+    used whole as the filename suffix, keeping a same-day session's files
+    distinct even if the caller supplies a custom stamp.
     """
 
     if stamp is None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rev = sanitize_filename_token(reviewer)
-    if rev:
-        name = f"{ANNOTATION_CSV_PREFIX}_{rev}_{stamp}.csv"
-    else:
-        name = f"{ANNOTATION_CSV_PREFIX}_{stamp}.csv"
-    return Path(output_dir) / name
+    rev = sanitize_filename_token(reviewer) or UNKNOWN_REVIEWER_DIR
+    date_part, sep, time_part = stamp.partition("_")
+    if sep and date_part and time_part:
+        return Path(output_dir) / rev / date_part / f"{ANNOTATION_CSV_PREFIX}_{time_part}.csv"
+    # No date/time split available: keep the whole stamp in the filename and
+    # file it directly under the reviewer.
+    return Path(output_dir) / rev / f"{ANNOTATION_CSV_PREFIX}_{stamp}.csv"
 
 
 def load_annotation_csv(path: Path) -> list[AnnotationRow]:
@@ -297,7 +310,9 @@ def load_annotation_folder(output_dir: Path) -> dict[tuple[str, str, str], Annot
     rows_by_key: dict[tuple[str, str, str], AnnotationRow] = {}
     if not output_dir.is_dir():
         return rows_by_key
-    candidates = sorted(output_dir.glob(ANNOTATION_CSV_GLOB), key=lambda p: p.stat().st_mtime)
+    # Recursive: sessions live in ``<reviewer>/<date>/`` subdirectories, and
+    # pre-migration runs may still have CSVs sitting at the root.
+    candidates = sorted(output_dir.rglob(ANNOTATION_CSV_GLOB), key=lambda p: p.stat().st_mtime)
     for csv_path in candidates:
         for row in load_annotation_csv(csv_path):
             rows_by_key[row.key] = row
