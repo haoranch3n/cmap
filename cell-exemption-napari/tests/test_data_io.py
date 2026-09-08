@@ -7,6 +7,7 @@ from cmap_cell_exemption_plugin.data_io import (
     discover_samples,
     load_annotation_folder,
     load_cell_boxes,
+    path_key,
     save_annotations_atomic,
 )
 from cmap_cell_exemption_plugin.models import (
@@ -108,3 +109,15 @@ def test_annotation_columns_start_with_image_name_cell_id(tmp_path: Path) -> Non
     save_annotations_atomic(out, [row])
     header = out.read_text().splitlines()[0].split(",")
     assert header[:2] == ["image_name", "cell_id"]
+
+
+def test_path_key_normalizes_mount_alias() -> None:
+    jude = (
+        "/research_jude/rgs01_jude/dept/DNB/core_operations/"
+        "ImageAnalysis/Core/Haoran/cmap/foo.tif"
+    )
+    dept = (
+        "/research/dept/dnb/core_operations/"
+        "ImageAnalysis/Core/Haoran/cmap/foo.tif"
+    )
+    assert path_key(jude) == path_key(dept)

@@ -510,13 +510,13 @@ class CellExemptionWidget(QWidget):
             self._fit_window_and_view()
 
     def _contrast_limits(self, data, ch: int):
-        """Estimate 1-99 percentile display contrast limits for one channel.
+        """Estimate 1-99.99 percentile display contrast limits for one channel.
 
         With lazy (dask) loading napari samples only the z=0 plane to guess
         contrast limits; for these stacks that plane is empty, so it falls back
         to ``[0, 1]`` and the float32 image saturates to solid white. We instead
         sample a few mid-stack slices (cheap: a handful of page decodes) and use
-        the 1st/99th percentiles so the image renders with sensible brightness.
+        the 1st/99.99th percentiles so the image renders with sensible brightness.
         """
         try:
             z_size = int(data.shape[0])
@@ -530,7 +530,7 @@ class CellExemptionWidget(QWidget):
             if sample.size == 0:
                 return None
             lo = float(np.percentile(sample, 1.0))
-            hi = float(np.percentile(sample, 99.0))
+            hi = float(np.percentile(sample, 99.99))
             if not (hi > lo):
                 lo, hi = float(sample.min()), float(sample.max())
             if not (hi > lo):
@@ -797,7 +797,18 @@ class CellExemptionWidget(QWidget):
         image_key = self._current_image_key()
         if image_key is None:
             return None
-        return self.rows_by_key.get((image_key, EXISTING_CELL, str(cell_id)))
+        row = self.rows_by_key.get((image_key, EXISTING_CELL, str(cell_id)))
+        if row is not None:
+            return row
+        # Match rows saved under an alternate mount alias (jude vs dept/dnb).
+        for candidate in self.rows_by_key.values():
+            if (
+                path_key(candidate.image_path) == image_key
+                and candidate.annotation_type == EXISTING_CELL
+                and candidate.cell_id == str(cell_id)
+            ):
+                return candidate
+        return None
 
     def _existing_label_for_cell(self, cell_id: int) -> str:
         row = self._existing_row_for_cell(cell_id)
@@ -1150,16 +1161,19 @@ class CellExemptionWidget(QWidget):
         if self.current_sample is None:
             self._sample_info.setText("No sample loaded.")
             return
-        existing = sum(
+        image_key = path_key(self.current_sample.image_path)
+        labeled = sum(
             1
             for row in self.rows_by_key.values()
-            if row.image_path == path_key(self.current_sample.image_path)
+            if path_key(row.image_path) == image_key
             and row.annotation_type == EXISTING_CELL
+            and row.label in (GOOD_LABEL, BAD_LABEL)
         )
+        total = len(self.cell_boxes)
         self._sample_info.setText(
             f"Sample {self.sample_index + 1} / {len(self.samples)}\n"
             f"{self.current_sample.batch}/{self.current_sample.sample}\n"
-            f"{existing} existing-cell labels in this sample."
+            f"{total} existing cells in this sample ({labeled} labeled)."
         )
 
     def _refresh_current_from_annotations(self) -> None:

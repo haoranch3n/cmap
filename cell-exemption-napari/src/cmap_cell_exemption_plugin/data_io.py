@@ -35,13 +35,19 @@ def path_key(path: Path | str) -> str:
     """Mount-stable absolute path key for matching annotations.
 
     This intentionally does not call `resolve()` or `realpath()` because CMAP
-    data may be reachable through multiple mount aliases.
+    data may be reachable through multiple mount aliases. Known alias pairs
+    (e.g. /research_jude/.../DNB/... vs /research/dept/dnb/...) are folded to
+    the dept/dnb spelling used by the napari symlink farms.
     """
 
     p = Path(path).expanduser()
     if not p.is_absolute():
         p = Path(os.getcwd()) / p
-    return os.path.normpath(str(p))
+    key = os.path.normpath(str(p))
+    return key.replace(
+        "/research_jude/rgs01_jude/dept/DNB/",
+        "/research/dept/dnb/",
+    )
 
 
 def infer_batch_sample(sample_dir: Path, root: Path) -> tuple[str, str]:
