@@ -126,6 +126,12 @@ Missing-cell rows use synthetic IDs such as `missing_0001`, scoped to the image,
 with `annotation_type=missing_cell`, `label=missing`, and `z_index` set to the
 active Z slice where the rectangle was drawn.
 
+Each missing-cell box is also mirrored into a read-only `CMAP Missing Box
+Z-Extent` layer as a faint cyan outline that stays visible on every Z slice, so
+the reviewer can see where a box was drawn after scrolling away from its slice.
+The guide is display-only: the drawn box remains the single source of truth, and
+the CSV still holds one row per box with its single `z_index`.
+
 ## Controls
 
 - `Open Output Root...`: discover reconstructed CMAP samples.

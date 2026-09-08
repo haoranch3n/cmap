@@ -37,7 +37,12 @@ from .data_io import (
     path_key,
     save_annotations_atomic,
 )
-from .geometry import cell_box_to_point, cell_box_to_slice_rectangle, corners_zyx_to_missing_box
+from .geometry import (
+    cell_box_to_point,
+    cell_box_to_slice_rectangle,
+    corners_zyx_to_full_z_rectangle_yx,
+    corners_zyx_to_missing_box,
+)
 from .models import (
     BAD_LABEL,
     EXISTING_CELL,
@@ -65,6 +70,7 @@ LAYER_CENTROIDS = "CMAP Cell Centers"
 LAYER_SELECTED_MASK = "CMAP Selected Cell Mask"
 LAYER_SELECTED_BOX = "CMAP Selected Cell Box"
 LAYER_MISSING = "CMAP Missing Cell Boxes"
+LAYER_MISSING_ZEXTENT = "CMAP Missing Box Z-Extent"
 
 PLUGIN_LAYER_NAMES = {
     LAYER_642,
@@ -76,6 +82,7 @@ PLUGIN_LAYER_NAMES = {
     LAYER_SELECTED_MASK,
     LAYER_SELECTED_BOX,
     LAYER_MISSING,
+    LAYER_MISSING_ZEXTENT,
 }
 
 CHANNELS = [
@@ -168,6 +175,7 @@ class CellExemptionWidget(QWidget):
         self._selected_mask_layer = None
         self._selected_box_layer = None
         self._missing_layer = None
+        self._missing_zextent_layer = None
 
         self._window_sized = False
         self._disabled_drag_to_zoom = None
@@ -283,7 +291,10 @@ class CellExemptionWidget(QWidget):
         self._missing_mode_btn.toggled.connect(self._set_missing_mode)
         self._delete_missing_btn = QPushButton("[D] Delete Selected Missing Box")
         self._delete_missing_btn.clicked.connect(self._delete_selected_missing)
-        self._missing_info = QLabel("Draw rectangles on the active Z slice.")
+        self._missing_info = QLabel(
+            "Draw rectangles on the active Z slice; the faint outline marks "
+            "that XY footprint on every Z slice."
+        )
         self._missing_info.setWordWrap(True)
         missing_layout.addWidget(self._missing_mode_btn)
         missing_layout.addWidget(self._delete_missing_btn)
@@ -504,6 +515,9 @@ class CellExemptionWidget(QWidget):
 
             self._section("boundary", _add_boundary)
             self._section("selected-box", self._add_selected_box_layer)
+            # Added before the editable layer so the solid box always draws on
+            # top of its own faint full-Z guide.
+            self._section("missing-zextent", self._add_missing_zextent_layer)
             self._section("missing", self._add_missing_layer)
         finally:
             self.viewer.title = f"CMAP Cell Exemption - {sample.batch}/{sample.sample}"
@@ -615,6 +629,58 @@ class CellExemptionWidget(QWidget):
             ndim=3,
         )
 
+    def _add_missing_zextent_layer(self) -> None:
+        """Read-only guide showing each missing box's XY footprint on every Z.
+
+        The shapes are 2D (``ndim=2``) while the image stack is 3D, so napari
+        broadcasts them across the Z axis instead of pinning them to one slice.
+        That keeps one shape per box — replicating a rectangle per Z slice would
+        mean hundreds of shapes to rebuild on every edit.
+        """
+        self._missing_zextent_layer = self.viewer.add_shapes(
+            name=LAYER_MISSING_ZEXTENT,
+            ndim=2,
+        )
+        # Never edited directly: the editable missing layer stays the single
+        # source of truth for what gets written to the annotation CSV.
+        for attr, value in (("editable", False), ("mode", "pan_zoom")):
+            try:
+                setattr(self._missing_zextent_layer, attr, value)
+            except Exception:
+                pass
+
+    def _box_edge_width(self, guide: bool = False) -> float:
+        """Border thickness that stays visible when the full field is fit."""
+        if self.label_data is None:
+            return 1.5 if guide else 3.0
+        base = max(2.0, round(min(self.label_data.shape[1:]) / 250.0))
+        return max(1.0, base / 2.0) if guide else base
+
+    def _refresh_missing_zextent(self) -> None:
+        """Mirror the current missing boxes into the full-Z guide layer."""
+        layer = self._missing_zextent_layer
+        if layer is None:
+            return
+        rects = []
+        if self._missing_layer is not None:
+            for i, corners in enumerate(self._missing_layer.data):
+                try:
+                    rects.append(corners_zyx_to_full_z_rectangle_yx(np.asarray(corners)))
+                except ValueError as exc:
+                    self._log(f"Skipping malformed missing box {i + 1} in guide: {exc}")
+        try:
+            layer.data = rects
+            # napari crashes if per-shape arrays are assigned to an empty
+            # Shapes layer, so only style when at least one box exists.
+            if rects:
+                n = len(rects)
+                layer.shape_type = ["rectangle"] * n
+                layer.face_color = _shape_rgba(n, (0.0, 0.8, 1.0, 0.0))
+                layer.edge_color = _shape_rgba(n, (0.0, 1.0, 1.0, 0.45))
+                layer.edge_width = [self._box_edge_width(guide=True)] * n
+        except Exception as exc:
+            self._log(f"[missing-zextent] {exc}")
+
     def _add_missing_layer(self) -> None:
         self._missing_layer = self.viewer.add_shapes(
             name=LAYER_MISSING,
@@ -643,6 +709,7 @@ class CellExemptionWidget(QWidget):
         self._selected_mask_layer = None
         self._selected_box_layer = None
         self._missing_layer = None
+        self._missing_zextent_layer = None
 
     def _populate_cell_combo(self) -> None:
         self._loading_ui = True
@@ -753,9 +820,7 @@ class CellExemptionWidget(QWidget):
             n = len(rects)
             # Scale the border thickness to the image so it stays visible when
             # the full field of view is fit to the window.
-            edge_w = 3.0
-            if self.label_data is not None:
-                edge_w = max(2.0, round(min(self.label_data.shape[1:]) / 250.0))
+            edge_w = self._box_edge_width()
             try:
                 self._selected_box_layer.edge_width = edge_w
                 self._selected_box_layer.data = rects
@@ -884,6 +949,7 @@ class CellExemptionWidget(QWidget):
         if self._suppress_missing_events:
             return
         self.dirty = True
+        self._refresh_missing_zextent()
         self._update_missing_info()
 
     def _toggle_drag_to_zoom(self, disabled: bool) -> None:
@@ -945,6 +1011,7 @@ class CellExemptionWidget(QWidget):
         finally:
             self._suppress_missing_events = False
         self.dirty = True
+        self._refresh_missing_zextent()
         self._update_missing_info()
 
     def _restore_missing_shapes(self) -> None:
@@ -1000,6 +1067,7 @@ class CellExemptionWidget(QWidget):
                 )
         finally:
             self._suppress_missing_events = False
+        self._refresh_missing_zextent()
         # Move the Z slider to a restored box so it is visible again instead of
         # being hidden on an off-screen slice.
         if z_indices:
@@ -1077,7 +1145,8 @@ class CellExemptionWidget(QWidget):
     def _update_missing_info(self) -> None:
         n = len(self._missing_layer.data) if self._missing_layer is not None else 0
         self._missing_info.setText(
-            f"{n} missing-cell box(es). Draw rectangles on the active Z slice."
+            f"{n} missing-cell box(es). Draw rectangles on the active Z slice; "
+            "the faint outline marks that XY footprint on every Z slice."
         )
 
     # ------------------------------------------------------------------

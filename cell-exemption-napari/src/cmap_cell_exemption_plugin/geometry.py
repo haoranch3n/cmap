@@ -68,6 +68,33 @@ def corners_zyx_to_missing_box(corners_zyx: np.ndarray) -> dict[str, float | int
     }
 
 
+def corners_zyx_to_full_z_rectangle_yx(corners_zyx: np.ndarray) -> np.ndarray:
+    """Return the axis-aligned `(y, x)` footprint of a 3D rectangle.
+
+    Dropping the Z column turns a single-slice missing-cell box into a 2D
+    shape. Placed on a 2D Shapes layer inside the 3D viewer, napari broadcasts
+    it across every Z slice, so the reviewer keeps seeing where they drew after
+    scrolling away from the slice they drew on.
+    """
+
+    corners = np.asarray(corners_zyx, dtype=np.float64)
+    if corners.shape != (4, 3):
+        raise ValueError(f"Expected 3D rectangle with shape (4, 3), got {corners.shape}")
+    ys = corners[:, 1]
+    xs = corners[:, 2]
+    min_y, max_y = float(ys.min()), float(ys.max())
+    min_x, max_x = float(xs.min()), float(xs.max())
+    return np.array(
+        [
+            [min_y, min_x],
+            [min_y, max_x],
+            [max_y, max_x],
+            [max_y, min_x],
+        ],
+        dtype=np.float64,
+    )
+
+
 def cell_box_to_point(box: CellBoxRecord) -> tuple[float, float, float]:
     """Return the cell centroid in Napari layer coordinate order `(z, y, x)`."""
 

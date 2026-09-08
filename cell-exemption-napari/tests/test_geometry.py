@@ -6,6 +6,7 @@ import pytest
 from cmap_cell_exemption_plugin.geometry import (
     box_center_size_to_corners_yx,
     corners_yx_to_box,
+    corners_zyx_to_full_z_rectangle_yx,
     corners_zyx_to_missing_box,
 )
 
@@ -41,3 +42,42 @@ def test_3d_missing_box_uses_z_slice() -> None:
 def test_bad_missing_box_shape_raises() -> None:
     with pytest.raises(ValueError):
         corners_zyx_to_missing_box(np.zeros((4, 2)))
+
+
+def test_full_z_rectangle_drops_z_and_keeps_xy_footprint() -> None:
+    corners = np.asarray(
+        [
+            [5.0, 10.0, 20.0],
+            [5.0, 10.0, 30.0],
+            [5.0, 18.0, 30.0],
+            [5.0, 18.0, 20.0],
+        ]
+    )
+    rect = corners_zyx_to_full_z_rectangle_yx(corners)
+    assert rect.shape == (4, 2)
+    assert rect[:, 0].min() == pytest.approx(10.0)
+    assert rect[:, 0].max() == pytest.approx(18.0)
+    assert rect[:, 1].min() == pytest.approx(20.0)
+    assert rect[:, 1].max() == pytest.approx(30.0)
+
+
+def test_full_z_rectangle_is_axis_aligned_whatever_the_draw_order() -> None:
+    # napari stores vertices in draw order, so a box dragged from its
+    # bottom-right corner arrives reversed; the guide must still be the same
+    # axis-aligned footprint.
+    corners = np.asarray(
+        [
+            [7.0, 18.0, 30.0],
+            [7.0, 18.0, 20.0],
+            [7.0, 10.0, 20.0],
+            [7.0, 10.0, 30.0],
+        ]
+    )
+    rect = corners_zyx_to_full_z_rectangle_yx(corners)
+    expected = np.asarray([[10.0, 20.0], [10.0, 30.0], [18.0, 30.0], [18.0, 20.0]])
+    assert np.allclose(rect, expected)
+
+
+def test_full_z_rectangle_rejects_2d_input() -> None:
+    with pytest.raises(ValueError):
+        corners_zyx_to_full_z_rectangle_yx(np.zeros((4, 2)))
